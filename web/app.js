@@ -1,6 +1,11 @@
 // ckpt — Preact + htm UI, no build step.
-import { html, render } from 'https://esm.sh/htm@3.1.1/preact/standalone';
-import { useState, useEffect, useCallback, useRef } from 'https://esm.sh/preact@10.19.3/hooks';
+// Important: hooks must come from the SAME Preact module that renders. Importing
+// both `html`/`render` AND the hooks from `htm/preact/standalone` keeps a single
+// Preact instance — otherwise `useState` fails with `undefined.__H`.
+import {
+  html, render,
+  useState, useEffect, useCallback, useRef,
+} from 'https://esm.sh/htm@3.1.1/preact/standalone';
 
 // ---------- API client ----------
 
