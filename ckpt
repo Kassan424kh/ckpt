@@ -1,0 +1,1146 @@
+#!/usr/bin/env python3
+"""
+ckpt — per-turn git-ref checkpoints for Claude Code, multi-project.
+
+Modes:
+    ckpt --hook save-prompt        UserPromptSubmit hook
+    ckpt --hook checkpoint         Stop hook
+    ckpt ui                        Launch web UI
+    ckpt list                      List current project's checkpoints
+    ckpt show <ref>                Diff of a checkpoint
+    ckpt restore [<ref> [path]]    Interactive picker, or full / single-file restore
+    ckpt undo                      Roll back the last restore
+    ckpt delete <ref>              Delete one checkpoint
+    ckpt latest                    Info about the newest checkpoint
+    ckpt prune <n>                 Keep only the most recent N
+    ckpt clean                     Delete all checkpoints
+    ckpt projects                  List known projects
+    ckpt migrate                   Migrate an old in-repo .claude/ install to this one
+    ckpt --help
+
+Storage:
+    Per-project:
+        <project>/.claude/checkpoints.db        prompts + checkpoint metadata
+        <project>/.git/refs/claude-checkpoints  snapshot refs (immutable commits)
+    Per-machine:
+        ~/.local/share/ckpt/projects.db         index of known projects
+        ~/.local/share/ckpt/web/                web UI assets (installed by install.sh)
+"""
+
+import argparse
+import hashlib
+import http.server
+import json
+import os
+import re
+import shutil
+import socket
+import sqlite3
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import webbrowser
+from pathlib import Path
+from urllib.parse import urlparse, parse_qs, unquote
+
+# ---------------- constants ----------------
+
+REF_NS = "refs/claude-checkpoints"
+TRASH_REF = "refs/claude-checkpoints-trash/last"
+PROJECT_DB_REL = ".claude/checkpoints.db"
+
+USER_DATA_DIR = Path.home() / ".local" / "share" / "ckpt"
+PROJECTS_DB = USER_DATA_DIR / "projects.db"
+WEB_DIR = USER_DATA_DIR / "web"
+
+
+# ---------------- git wrappers ----------------
+
+def git(*args, cwd=None):
+    """Run git in a project dir and return (stdout, stderr, returncode)."""
+    r = subprocess.run(["git", *args], capture_output=True, text=True, cwd=cwd)
+    return r.stdout, r.stderr, r.returncode
+
+
+def is_git_repo(cwd=None):
+    _, _, code = git("rev-parse", "--git-dir", cwd=cwd)
+    return code == 0
+
+
+def project_root(cwd=None):
+    out, _, code = git("rev-parse", "--show-toplevel", cwd=cwd)
+    return out.strip() if code == 0 else (cwd or os.getcwd())
+
+
+def claude_project_dir():
+    """Best-effort detection of the project Claude Code thinks we're in."""
+    return os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()
+
+
+# ---------------- per-project db ----------------
+
+def project_db_path(root):
+    return Path(root) / PROJECT_DB_REL
+
+
+PROJECT_SCHEMA = """
+CREATE TABLE IF NOT EXISTS prompts (
+    session_id   TEXT NOT NULL,
+    submitted_at INTEGER NOT NULL,
+    prompt       TEXT NOT NULL,
+    PRIMARY KEY (session_id, submitted_at)
+);
+CREATE TABLE IF NOT EXISTS checkpoints (
+    id            TEXT PRIMARY KEY,
+    session_id    TEXT,
+    prompt        TEXT,
+    created_at    INTEGER,
+    files_changed INTEGER,
+    insertions    INTEGER,
+    deletions     INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_prompts_session_time ON prompts(session_id, submitted_at DESC);
+"""
+
+
+def project_db_connect(root, create=True):
+    path = project_db_path(root)
+    if not path.exists() and not create:
+        return None
+    path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(path))
+    conn.executescript(PROJECT_SCHEMA)
+    # Migrate older schemas missing the stats columns.
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(checkpoints)").fetchall()}
+    for col in ("files_changed", "insertions", "deletions"):
+        if col not in cols:
+            conn.execute(f"ALTER TABLE checkpoints ADD COLUMN {col} INTEGER")
+    conn.commit()
+    return conn
+
+
+# ---------------- per-machine projects db ----------------
+
+PROJECTS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS projects (
+    id            TEXT PRIMARY KEY,
+    path          TEXT UNIQUE NOT NULL,
+    name          TEXT,
+    registered_at INTEGER,
+    last_seen     INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_projects_seen ON projects(last_seen DESC);
+"""
+
+
+def projects_db_connect():
+    USER_DATA_DIR.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(PROJECTS_DB))
+    conn.executescript(PROJECTS_SCHEMA)
+    return conn
+
+
+def project_id_for(path):
+    """Deterministic short id for a path (sha256[:8])."""
+    return hashlib.sha256(os.path.realpath(path).encode()).hexdigest()[:8]
+
+
+def register_project(path):
+    """Insert or update the project entry, return its id."""
+    if not path:
+        return None
+    real = os.path.realpath(path)
+    pid = project_id_for(real)
+    name = os.path.basename(real)
+    now = int(time.time())
+    try:
+        conn = projects_db_connect()
+        conn.execute(
+            "INSERT INTO projects (id, path, name, registered_at, last_seen) "
+            "VALUES (?, ?, ?, ?, ?) "
+            "ON CONFLICT(id) DO UPDATE SET last_seen = excluded.last_seen, name = excluded.name",
+            (pid, real, name, now, now),
+        )
+        conn.commit()
+        conn.close()
+    except Exception:
+        pass
+    return pid
+
+
+def list_projects(include_missing=False):
+    """Return list of {id, path, name, last_seen, exists}. Newest first."""
+    try:
+        conn = projects_db_connect()
+        rows = conn.execute(
+            "SELECT id, path, name, registered_at, last_seen FROM projects "
+            "ORDER BY last_seen DESC"
+        ).fetchall()
+        conn.close()
+    except Exception:
+        rows = []
+    out = []
+    for pid, path, name, reg, seen in rows:
+        exists = os.path.isdir(path) and os.path.isdir(os.path.join(path, ".git"))
+        if include_missing or exists:
+            out.append({
+                "id": pid, "path": path, "name": name,
+                "registered_at": reg, "last_seen": seen, "exists": exists,
+            })
+    return out
+
+
+def get_project(project_id):
+    try:
+        conn = projects_db_connect()
+        row = conn.execute(
+            "SELECT id, path, name, registered_at, last_seen FROM projects WHERE id = ?",
+            (project_id,),
+        ).fetchone()
+        conn.close()
+    except Exception:
+        return None
+    if not row:
+        return None
+    return {"id": row[0], "path": row[1], "name": row[2],
+            "registered_at": row[3], "last_seen": row[4]}
+
+
+# ---------------- helpers shared by hooks + UI ----------------
+
+def make_snapshot_commit(root, message):
+    """Snapshot working tree (incl. untracked, respecting .gitignore) into a
+    parentless-or-from-HEAD commit. Live index/worktree untouched.
+    Returns commit hash or None."""
+    git_dir, _, code = git("rev-parse", "--git-dir", cwd=root)
+    if code != 0:
+        return None
+    git_dir = git_dir.strip()
+    if not os.path.isabs(git_dir):
+        git_dir = os.path.join(root, git_dir)
+    live_index = os.path.join(git_dir, "index")
+
+    tmp = tempfile.NamedTemporaryFile(delete=False, prefix="ckpt-idx-", suffix=".idx")
+    tmp.close()
+    try:
+        if os.path.exists(live_index):
+            shutil.copyfile(live_index, tmp.name)
+        env = os.environ.copy()
+        env["GIT_INDEX_FILE"] = tmp.name
+        subprocess.run(["git", "add", "-A"], env=env, capture_output=True, cwd=root)
+        r = subprocess.run(["git", "write-tree"], env=env, capture_output=True, text=True, cwd=root)
+        if r.returncode != 0:
+            return None
+        tree = r.stdout.strip()
+        if not tree:
+            return None
+        head, _, code = git("rev-parse", "HEAD", cwd=root)
+        head = head.strip() if code == 0 else ""
+        cmd = ["git", "commit-tree", tree, "-m", message]
+        if head:
+            cmd.extend(["-p", head])
+        r = subprocess.run(cmd, capture_output=True, text=True, cwd=root)
+        return r.stdout.strip() if r.returncode == 0 else None
+    finally:
+        try:
+            os.unlink(tmp.name)
+        except Exception:
+            pass
+
+
+def compute_shortstat(root, ref):
+    out, _, _ = git("diff", "--shortstat", f"{ref}^", ref, cwd=root)
+    files = ins = dels = 0
+    m = re.search(r"(\d+) files? changed", out)
+    if m: files = int(m.group(1))
+    m = re.search(r"(\d+) insertions?\(\+\)", out)
+    if m: ins = int(m.group(1))
+    m = re.search(r"(\d+) deletions?\(-\)", out)
+    if m: dels = int(m.group(1))
+    return files, ins, dels
+
+
+def list_checkpoints(root):
+    """Return list of {id, ref, when, iso, message, stats}. Newest first.
+    Caches stats in the project's SQLite db on first compute."""
+    out, _, _ = git(
+        "for-each-ref", f"{REF_NS}/", "--sort=-refname",
+        "--format=%(refname)\x1f%(refname:short)\x1f%(authordate:relative)\x1f%(authordate:iso)\x1f%(contents:subject)",
+        cwd=root,
+    )
+    # Stats cache from db
+    stats_cache = {}
+    conn = project_db_connect(root, create=False)
+    if conn:
+        try:
+            for cid, f, i, d in conn.execute(
+                "SELECT id, files_changed, insertions, deletions FROM checkpoints "
+                "WHERE files_changed IS NOT NULL"
+            ).fetchall():
+                stats_cache[cid] = {"files": f or 0, "insertions": i or 0, "deletions": d or 0}
+        except Exception:
+            pass
+
+    rows = []
+    to_persist = []
+    for line in out.splitlines():
+        parts = line.split("\x1f")
+        if len(parts) < 5:
+            continue
+        ref, short, when, iso, subject = parts
+        cid = ref.rsplit("/", 1)[-1]
+        msg = re.sub(r"^On [^:]+: ", "", subject)
+        stats = stats_cache.get(cid)
+        if not stats:
+            files, ins, dels = compute_shortstat(root, ref)
+            stats = {"files": files, "insertions": ins, "deletions": dels}
+            to_persist.append((cid, files, ins, dels))
+        rows.append({"id": cid, "ref": ref, "when": when, "iso": iso, "message": msg, "stats": stats})
+
+    if conn and to_persist:
+        try:
+            conn.executemany(
+                "INSERT INTO checkpoints (id, files_changed, insertions, deletions) "
+                "VALUES (?, ?, ?, ?) "
+                "ON CONFLICT(id) DO UPDATE SET "
+                "    files_changed = excluded.files_changed, "
+                "    insertions    = excluded.insertions, "
+                "    deletions     = excluded.deletions",
+                to_persist,
+            )
+            conn.commit()
+        except Exception:
+            pass
+    if conn:
+        conn.close()
+    return rows
+
+
+def get_files_for(root, ref):
+    out, _, _ = git("diff", "--name-status", f"{ref}^", ref, cwd=root)
+    files = []
+    for line in out.splitlines():
+        parts = line.split("\t")
+        if len(parts) >= 2:
+            files.append({"status": parts[0], "path": parts[-1]})
+    return files
+
+
+def get_file_diff(root, ref, path):
+    out, _, _ = git("diff", f"{ref}^", ref, "--", path, cwd=root)
+    return out
+
+
+def get_prompt_for(root, ckpt_id):
+    conn = project_db_connect(root, create=False)
+    if not conn:
+        return None
+    try:
+        row = conn.execute("SELECT prompt FROM checkpoints WHERE id = ?", (ckpt_id,)).fetchone()
+        conn.close()
+        return row[0] if row and row[0] else None
+    except Exception:
+        return None
+
+
+def has_trash(root):
+    _, _, code = git("rev-parse", "--verify", TRASH_REF, cwd=root)
+    return code == 0
+
+
+def status_for(root):
+    branch, _, _ = git("branch", "--show-current", cwd=root)
+    return {
+        "branch": branch.strip(),
+        "has_undo": has_trash(root),
+        "count": len(list_checkpoints(root)),
+    }
+
+
+# ---------------- restore operations ----------------
+
+def op_restore_full(root, ref):
+    safety = make_snapshot_commit(root, f"pre-restore safety ({time.strftime('%Y-%m-%d %H:%M:%S')})")
+    if safety:
+        git("update-ref", TRASH_REF, safety, cwd=root)
+    _, err, code = git("read-tree", "--reset", "-u", ref, cwd=root)
+    if code != 0:
+        return {"ok": False, "error": (err or "read-tree failed").strip()}
+
+    out, _, _ = git("for-each-ref", f"{REF_NS}/", "--format=%(refname)", cwd=root)
+    target_basename = ref.rsplit("/", 1)[-1]
+    deleted = 0
+    for r in out.splitlines():
+        if not r.strip():
+            continue
+        if r.rsplit("/", 1)[-1] > target_basename:
+            git("update-ref", "-d", r, cwd=root)
+            deleted += 1
+    # Cleanup SQLite rows for deleted refs
+    cleanup_orphan_rows(root)
+    return {"ok": True, "deleted": deleted, "safety": bool(safety)}
+
+
+def op_restore_file(root, ref, path):
+    if not path:
+        return {"ok": False, "error": "missing path"}
+    _, err, code = git("checkout", ref, "--", path, cwd=root)
+    if code != 0:
+        return {"ok": False, "error": err.strip() or "checkout failed"}
+    return {"ok": True}
+
+
+def op_delete(root, ref):
+    _, err, code = git("update-ref", "-d", ref, cwd=root)
+    if code == 0:
+        conn = project_db_connect(root, create=False)
+        if conn:
+            try:
+                conn.execute("DELETE FROM checkpoints WHERE id = ?", (ref.rsplit("/", 1)[-1],))
+                conn.commit()
+                conn.close()
+            except Exception:
+                pass
+    return {"ok": code == 0, "error": err.strip() if code != 0 else None}
+
+
+def op_prune(root, n):
+    out, _, _ = git("for-each-ref", f"{REF_NS}/", "--sort=-refname", "--format=%(refname)", cwd=root)
+    refs = [r for r in out.splitlines() if r.strip()]
+    victims = refs[n:]
+    for r in victims:
+        git("update-ref", "-d", r, cwd=root)
+    cleanup_orphan_rows(root)
+    return {"ok": True, "deleted": len(victims)}
+
+
+def op_clean(root):
+    out, _, _ = git("for-each-ref", f"{REF_NS}/", "--format=%(refname)", cwd=root)
+    count = 0
+    for r in out.splitlines():
+        if r.strip():
+            git("update-ref", "-d", r, cwd=root)
+            count += 1
+    git("update-ref", "-d", TRASH_REF, cwd=root)
+    conn = project_db_connect(root, create=False)
+    if conn:
+        try:
+            conn.execute("DELETE FROM checkpoints")
+            conn.commit()
+            conn.close()
+        except Exception:
+            pass
+    return {"ok": True, "deleted": count}
+
+
+def op_undo(root):
+    if not has_trash(root):
+        return {"ok": False, "error": "no recent restore to undo"}
+    _, err, code = git("read-tree", "--reset", "-u", TRASH_REF, cwd=root)
+    if code != 0:
+        return {"ok": False, "error": err.strip() or "read-tree failed"}
+    return {"ok": True}
+
+
+def cleanup_orphan_rows(root):
+    """Delete SQLite rows for checkpoint ids whose refs no longer exist."""
+    conn = project_db_connect(root, create=False)
+    if not conn:
+        return
+    try:
+        out, _, _ = git("for-each-ref", f"{REF_NS}/", "--format=%(refname)", cwd=root)
+        live = {l.rsplit("/", 1)[-1] for l in out.splitlines() if l.strip()}
+        ids = [r[0] for r in conn.execute("SELECT id FROM checkpoints").fetchall()]
+        for cid in ids:
+            if cid not in live:
+                conn.execute("DELETE FROM checkpoints WHERE id = ?", (cid,))
+        conn.commit()
+        conn.close()
+    except Exception:
+        pass
+
+
+# ---------------- hooks ----------------
+
+def hook_save_prompt():
+    """UserPromptSubmit hook: persist the full prompt into the project's db,
+    and register the project in the per-machine projects index."""
+    try:
+        data = json.load(sys.stdin)
+    except Exception:
+        return
+    sid = (data.get("session_id") or "").strip()
+    prompt = (data.get("prompt") or "").strip()
+    cwd = data.get("cwd") or claude_project_dir()
+    if not sid or not prompt:
+        return
+    if not is_git_repo(cwd):
+        return
+    root = project_root(cwd)
+    register_project(root)
+    conn = project_db_connect(root)
+    try:
+        conn.execute(
+            "INSERT OR REPLACE INTO prompts(session_id, submitted_at, prompt) VALUES (?, ?, ?)",
+            (sid, int(time.time()), prompt),
+        )
+        # Cull rows older than 30 days
+        conn.execute(
+            "DELETE FROM prompts WHERE submitted_at < ?",
+            (int(time.time()) - 30 * 86400,),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def hook_checkpoint():
+    """Stop hook: snapshot the working tree and record the checkpoint."""
+    try:
+        data = json.load(sys.stdin)
+    except Exception:
+        data = {}
+    sid = (data.get("session_id") or "").strip()
+    cwd = data.get("cwd") or claude_project_dir()
+    if not is_git_repo(cwd):
+        return
+    root = project_root(cwd)
+    register_project(root)
+
+    # Fetch the latest prompt for this session, if any.
+    prompt = None
+    if sid:
+        conn = project_db_connect(root, create=False)
+        if conn:
+            try:
+                row = conn.execute(
+                    "SELECT prompt FROM prompts WHERE session_id = ? "
+                    "ORDER BY submitted_at DESC LIMIT 1",
+                    (sid,),
+                ).fetchone()
+                prompt = row[0] if row else None
+                conn.close()
+            except Exception:
+                pass
+
+    msg = (prompt.splitlines()[0] if prompt and prompt.strip() else None) or "(turn)"
+
+    # Build the snapshot
+    git_dir, _, _ = git("rev-parse", "--git-dir", cwd=root)
+    git_dir = git_dir.strip()
+    if not os.path.isabs(git_dir):
+        git_dir = os.path.join(root, git_dir)
+    live_index = os.path.join(git_dir, "index")
+
+    tmp = tempfile.NamedTemporaryFile(delete=False, prefix="ckpt-idx-", suffix=".idx")
+    tmp.close()
+    try:
+        if os.path.exists(live_index):
+            shutil.copyfile(live_index, tmp.name)
+        env = os.environ.copy()
+        env["GIT_INDEX_FILE"] = tmp.name
+        subprocess.run(["git", "add", "-A"], env=env, capture_output=True, cwd=root)
+        r = subprocess.run(["git", "write-tree"], env=env, capture_output=True, text=True, cwd=root)
+        if r.returncode != 0:
+            return
+        tree = r.stdout.strip()
+        if not tree:
+            return
+    finally:
+        try:
+            os.unlink(tmp.name)
+        except Exception:
+            pass
+
+    # Skip if identical to the most recent checkpoint (or HEAD if none).
+    latest_r = subprocess.run(
+        ["git", "for-each-ref", f"{REF_NS}/", "--sort=-refname", "--format=%(refname)", "--count=1"],
+        capture_output=True, text=True, cwd=root,
+    )
+    latest = latest_r.stdout.strip()
+    if latest:
+        lt = subprocess.run(["git", "rev-parse", f"{latest}^{{tree}}"], capture_output=True, text=True, cwd=root).stdout.strip()
+        if tree == lt:
+            return
+    else:
+        ht_r = subprocess.run(["git", "rev-parse", "HEAD^{tree}"], capture_output=True, text=True, cwd=root)
+        if tree == ht_r.stdout.strip():
+            return
+
+    head, _, _ = git("rev-parse", "HEAD", cwd=root)
+    head = head.strip()
+    cmd = ["git", "commit-tree", tree, "-m", msg]
+    if head:
+        cmd.extend(["-p", head])
+    commit = subprocess.run(cmd, capture_output=True, text=True, cwd=root).stdout.strip()
+    if not commit:
+        return
+
+    ckpt_id = time.strftime("%Y%m%d-%H%M%S")
+    ref = f"{REF_NS}/{ckpt_id}"
+    _, _, code = git("update-ref", ref, commit, cwd=root)
+    if code != 0:
+        return
+
+    # Compute shortstat
+    files, ins, dels = compute_shortstat(root, ref)
+
+    # Store in project db
+    conn = project_db_connect(root)
+    try:
+        conn.execute(
+            "INSERT OR REPLACE INTO checkpoints"
+            "(id, session_id, prompt, created_at, files_changed, insertions, deletions) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (ckpt_id, sid or None, prompt, int(time.time()), files, ins, dels),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    # Prune git refs to last 100
+    out, _, _ = git("for-each-ref", f"{REF_NS}/", "--sort=-refname", "--format=%(refname)", cwd=root)
+    refs = [r.strip() for r in out.splitlines() if r.strip()]
+    for old in refs[100:]:
+        git("update-ref", "-d", old, cwd=root)
+    cleanup_orphan_rows(root)
+
+
+# ---------------- CLI commands ----------------
+
+def die(msg, code=1):
+    print(f"error: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def _resolve_ref(root, arg):
+    """Like the bash CLI: latest/last/-1, -N, full timestamp, partial, or full ref."""
+    if not arg:
+        return ""
+    if arg in ("latest", "last", "-1"):
+        out, _, _ = git("for-each-ref", f"{REF_NS}/", "--sort=-refname", "--format=%(refname)", "--count=1", cwd=root)
+        return out.strip()
+    if re.match(r"^-\d+$", arg):
+        n = int(arg[1:])
+        out, _, _ = git("for-each-ref", f"{REF_NS}/", "--sort=-refname", "--format=%(refname)", cwd=root)
+        lines = [l for l in out.splitlines() if l.strip()]
+        return lines[n - 1] if 1 <= n <= len(lines) else ""
+    _, _, code = git("rev-parse", "--verify", arg, cwd=root)
+    if code == 0:
+        return arg
+    candidate = f"{REF_NS}/{arg}"
+    _, _, code = git("rev-parse", "--verify", candidate, cwd=root)
+    if code == 0:
+        return candidate
+    out, _, _ = git("for-each-ref", f"{REF_NS}/", "--sort=-refname", "--format=%(refname)", cwd=root)
+    for line in out.splitlines():
+        if arg in line:
+            return line.strip()
+    return ""
+
+
+def _format_msg(subject):
+    msg = re.sub(r"^On [^:]+: ", "", subject)
+    msg = msg.replace("\t", " ")
+    return msg[:57] + "..." if len(msg) > 60 else msg
+
+
+def cmd_list():
+    root = project_root()
+    if not is_git_repo(root):
+        die("not a git repository")
+    rows = list_checkpoints(root)
+    if not rows:
+        print("(no checkpoints)")
+        return
+    for r in rows:
+        s = r["stats"]
+        stats_str = ""
+        parts = []
+        if s["insertions"]:
+            parts.append(f"+{s['insertions']}")
+        if s["deletions"]:
+            parts.append(f"-{s['deletions']}")
+        if s["files"]:
+            parts.append(f"{s['files']}f")
+        if parts:
+            stats_str = "  " + " ".join(parts)
+        print(f"{r['when']:<16}  {_format_msg(r['message']):<55}  {r['id']}{stats_str}")
+
+
+def cmd_show(args):
+    root = project_root()
+    ref = _resolve_ref(root, args.ref)
+    if not ref:
+        die(f"checkpoint not found: {args.ref}")
+    out, _, _ = git("diff", f"{ref}^", ref, cwd=root)
+    sys.stdout.write(out)
+
+
+def cmd_latest():
+    root = project_root()
+    out, _, _ = git("for-each-ref", f"{REF_NS}/", "--sort=-refname", "--format=%(refname)", "--count=1", cwd=root)
+    ref = out.strip()
+    if not ref:
+        print("(no checkpoints)")
+        return
+    cid = ref.rsplit("/", 1)[-1]
+    out, _, _ = git("for-each-ref", ref, "--format=%(authordate:relative)\t%(contents:subject)", cwd=root)
+    when, _, subject = out.strip().partition("\t")
+    print(f"{when:<16}  {_format_msg(subject):<55}  {cid}")
+    print()
+    out, _, _ = git("diff", "--stat", f"{ref}^", ref, cwd=root)
+    sys.stdout.write(out)
+
+
+def cmd_delete(args):
+    root = project_root()
+    ref = _resolve_ref(root, args.ref)
+    if not ref:
+        die(f"checkpoint not found: {args.ref}")
+    r = op_delete(root, ref)
+    if r["ok"]:
+        print(f"deleted: {ref}")
+    else:
+        die(r.get("error") or "delete failed")
+
+
+def cmd_prune(args):
+    root = project_root()
+    r = op_prune(root, args.n)
+    if r["deleted"]:
+        print(f"pruned {r['deleted']} checkpoint(s); kept newest {args.n}")
+    else:
+        print("nothing to prune")
+
+
+def cmd_clean():
+    root = project_root()
+    out, _, _ = git("for-each-ref", f"{REF_NS}/", "--format=%(refname)", cwd=root)
+    count = sum(1 for l in out.splitlines() if l.strip())
+    if count == 0:
+        print("(nothing to clean)")
+        return
+    print(f"delete all {count} checkpoint(s)? [y/N] ", end="", flush=True)
+    if (input() or "").lower() != "y":
+        print("aborted")
+        return
+    r = op_clean(root)
+    print(f"deleted {r['deleted']} checkpoint(s)")
+
+
+def cmd_undo():
+    root = project_root()
+    r = op_undo(root)
+    if r["ok"]:
+        print("reverted to pre-restore state.")
+    else:
+        die(r.get("error") or "undo failed")
+
+
+def cmd_restore(args):
+    root = project_root()
+    if not args.ref:
+        return _restore_interactive(root)
+    ref = _resolve_ref(root, args.ref)
+    if not ref:
+        die(f"checkpoint not found: {args.ref}")
+    if args.path:
+        r = op_restore_file(root, ref, args.path)
+        if r["ok"]:
+            print(f"restored: {args.path}  (from {ref.split('/', 2)[-1]})")
+        else:
+            die(r.get("error") or "restore failed")
+        return
+    _confirm_full_restore(root, ref)
+
+
+def _restore_interactive(root):
+    rows = list_checkpoints(root)
+    if not rows:
+        die("no checkpoints")
+    has_fzf = shutil.which("fzf") is not None
+    if has_fzf:
+        lines = []
+        for r in rows:
+            stat = f"+{r['stats']['insertions']} -{r['stats']['deletions']} · {r['stats']['files']}f"
+            lines.append(f"{r['ref']}\t{r['when']:<14}  {_format_msg(r['message']):<55}  {r['id']}  {stat}")
+        try:
+            res = subprocess.run(
+                ["fzf", "--delimiter=\t", "--with-nth=2", "--prompt=restore to> ",
+                 "--height=80%", "--reverse", "--no-mouse",
+                 "--preview", "git diff {1}^ {1} 2>/dev/null | head -200",
+                 "--preview-window=right:60%:wrap",
+                 "--header=↑/↓ navigate · / search · enter restore · esc cancel"],
+                input="\n".join(lines), capture_output=True, text=True,
+            )
+            if res.returncode != 0 or not res.stdout.strip():
+                print("aborted")
+                return
+            target = res.stdout.split("\t", 1)[0].strip()
+        except FileNotFoundError:
+            has_fzf = False
+    if not has_fzf:
+        for i, r in enumerate(rows, 1):
+            print(f"{i:3}) {r['when']:<14}  {_format_msg(r['message']):<55}  {r['id']}")
+        print()
+        choice = input("select number (empty to cancel): ").strip()
+        if not choice:
+            print("aborted")
+            return
+        if not choice.isdigit():
+            die(f"invalid number: {choice}")
+        n = int(choice)
+        if n < 1 or n > len(rows):
+            die(f"no checkpoint at index {n}")
+        target = rows[n - 1]["ref"]
+    _confirm_full_restore(root, target)
+
+
+def _confirm_full_restore(root, ref):
+    cid = ref.rsplit("/", 1)[-1]
+    print()
+    print(f"  Checkpoint: {cid}")
+    stat_out, _, _ = git("diff", "--stat", f"{ref}^", ref, cwd=root)
+    for line in stat_out.splitlines():
+        print(f"    {line}")
+    print()
+    print("  This will:")
+    print("    1. Reset your working tree and index to this checkpoint")
+    print("    2. Delete all checkpoints created AFTER this one")
+    print(f"    3. Save the current state under '{TRASH_REF}' so you can 'ckpt undo'")
+    print()
+    ans = input("  proceed? [y/N] ").strip().lower()
+    if ans != "y":
+        print("aborted")
+        return
+    r = op_restore_full(root, ref)
+    if not r["ok"]:
+        die(r.get("error") or "restore failed")
+    print(f"  restored to: {cid}")
+    if r["deleted"]:
+        print(f"  deleted {r['deleted']} later checkpoint(s)")
+    if r.get("safety"):
+        print("  to undo: ckpt undo")
+
+
+def cmd_projects():
+    projects = list_projects(include_missing=True)
+    if not projects:
+        print("(no projects registered yet)")
+        return
+    for p in projects:
+        marker = " " if p["exists"] else "✗"
+        print(f"{marker} {p['id']}  {p['name']:<24}  {p['path']}")
+
+
+# ---------------- migrate ----------------
+
+def cmd_migrate():
+    """Move a project from the old in-repo .claude/ setup to the system-wide ckpt."""
+    root = project_root()
+    if not is_git_repo(root):
+        die("not a git repository")
+
+    print(f"migrating {root}")
+    pid = register_project(root)
+    print(f"  registered as project {pid}")
+
+    legacy = [
+        ".claude/hooks/save-prompt.sh",
+        ".claude/hooks/checkpoint.sh",
+        ".claude/checkpoint.sh",
+        ".claude/checkpoint-ui.py",
+        ".claude/CHECKPOINTS.md",
+    ]
+    removed = 0
+    for rel in legacy:
+        p = Path(root) / rel
+        if p.exists():
+            p.unlink()
+            removed += 1
+            print(f"  removed: {rel}")
+
+    hooks_dir = Path(root) / ".claude/hooks"
+    if hooks_dir.exists() and not any(hooks_dir.iterdir()):
+        hooks_dir.rmdir()
+        print("  removed: .claude/hooks/")
+
+    settings_path = Path(root) / ".claude/settings.json"
+    if settings_path.exists():
+        try:
+            data = json.loads(settings_path.read_text())
+        except Exception:
+            data = {}
+        if "hooks" in data:
+            for event in ("UserPromptSubmit", "Stop"):
+                if event in data["hooks"]:
+                    kept = []
+                    for entry in data["hooks"][event]:
+                        new_hooks = [h for h in entry.get("hooks", [])
+                                     if "checkpoint.sh" not in h.get("command", "")
+                                     and "save-prompt.sh" not in h.get("command", "")]
+                        if new_hooks:
+                            entry["hooks"] = new_hooks
+                            kept.append(entry)
+                    if kept:
+                        data["hooks"][event] = kept
+                    else:
+                        del data["hooks"][event]
+            if not data["hooks"]:
+                del data["hooks"]
+            settings_path.write_text(json.dumps(data, indent=2) + "\n")
+            print("  cleaned: .claude/settings.json (hooks block)")
+
+    print("  kept:    .claude/checkpoints.db (your data)")
+    print("  kept:    refs/claude-checkpoints/* (your snapshots)")
+    print()
+    print("Migration done. The global hook in ~/.claude/settings.json now handles this project.")
+
+
+# ---------------- UI server ----------------
+
+def find_free_port(start=8765, limit=50):
+    for p in range(start, start + limit):
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.bind(("127.0.0.1", p))
+                return p
+        except OSError:
+            continue
+    raise RuntimeError(f"no free port in {start}..{start+limit}")
+
+
+class UIHandler(http.server.BaseHTTPRequestHandler):
+    def log_message(self, *args):
+        pass
+
+    def _send_json(self, obj, status=200):
+        body = json.dumps(obj).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _send_text(self, text, status=200, ctype="text/plain; charset=utf-8"):
+        body = text.encode() if isinstance(text, str) else text
+        self.send_response(status)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _read_json(self):
+        length = int(self.headers.get("Content-Length", 0))
+        if not length:
+            return {}
+        try:
+            return json.loads(self.rfile.read(length))
+        except Exception:
+            return {}
+
+    def _project_root_for(self, pid):
+        p = get_project(pid)
+        if not p:
+            return None
+        path = p["path"]
+        if not os.path.isdir(path):
+            return None
+        return path
+
+    def do_GET(self):
+        u = urlparse(self.path)
+        p = u.path
+        q = parse_qs(u.query)
+        try:
+            if p == "/" or p == "/index.html":
+                self._serve_file(WEB_DIR / "index.html", "text/html; charset=utf-8")
+                return
+            if p == "/app.js":
+                self._serve_file(WEB_DIR / "app.js", "application/javascript; charset=utf-8")
+                return
+            if p == "/styles.css":
+                self._serve_file(WEB_DIR / "styles.css", "text/css; charset=utf-8")
+                return
+            if p == "/api/projects":
+                self._send_json(list_projects())
+                return
+
+            m = re.match(r"^/api/projects/([^/]+)/status$", p)
+            if m:
+                root = self._project_root_for(m.group(1))
+                if not root: return self._send_json({"error": "project not found"}, status=404)
+                self._send_json(status_for(root)); return
+
+            m = re.match(r"^/api/projects/([^/]+)/checkpoints$", p)
+            if m:
+                root = self._project_root_for(m.group(1))
+                if not root: return self._send_json({"error": "project not found"}, status=404)
+                self._send_json(list_checkpoints(root)); return
+
+            m = re.match(r"^/api/projects/([^/]+)/checkpoints/([^/]+)/prompt$", p)
+            if m:
+                root = self._project_root_for(m.group(1))
+                if not root: return self._send_json({"error": "project not found"}, status=404)
+                self._send_json({"prompt": get_prompt_for(root, m.group(2))}); return
+
+            m = re.match(r"^/api/projects/([^/]+)/checkpoints/([^/]+)/files$", p)
+            if m:
+                root = self._project_root_for(m.group(1))
+                if not root: return self._send_json({"error": "project not found"}, status=404)
+                ref = f"{REF_NS}/{m.group(2)}"
+                self._send_json(get_files_for(root, ref)); return
+
+            m = re.match(r"^/api/projects/([^/]+)/checkpoints/([^/]+)/file-diff$", p)
+            if m:
+                root = self._project_root_for(m.group(1))
+                if not root: return self._send_text("", 404)
+                ref = f"{REF_NS}/{m.group(2)}"
+                path = unquote((q.get("path") or [""])[0])
+                self._send_text(get_file_diff(root, ref, path)); return
+
+            self.send_error(404)
+        except Exception as e:
+            self._send_json({"error": str(e)}, status=500)
+
+    def do_POST(self):
+        u = urlparse(self.path)
+        p = u.path
+        try:
+            m = re.match(r"^/api/projects/([^/]+)/checkpoints/([^/]+)/restore$", p)
+            if m:
+                root = self._project_root_for(m.group(1))
+                if not root: return self._send_json({"ok": False, "error": "project not found"}, status=404)
+                ref = f"{REF_NS}/{m.group(2)}"
+                self._send_json(op_restore_full(root, ref)); return
+
+            m = re.match(r"^/api/projects/([^/]+)/checkpoints/([^/]+)/restore-file$", p)
+            if m:
+                root = self._project_root_for(m.group(1))
+                if not root: return self._send_json({"ok": False, "error": "project not found"}, status=404)
+                ref = f"{REF_NS}/{m.group(2)}"
+                data = self._read_json()
+                self._send_json(op_restore_file(root, ref, data.get("path", ""))); return
+
+            m = re.match(r"^/api/projects/([^/]+)/checkpoints/([^/]+)/delete$", p)
+            if m:
+                root = self._project_root_for(m.group(1))
+                if not root: return self._send_json({"ok": False, "error": "project not found"}, status=404)
+                ref = f"{REF_NS}/{m.group(2)}"
+                self._send_json(op_delete(root, ref)); return
+
+            m = re.match(r"^/api/projects/([^/]+)/prune$", p)
+            if m:
+                root = self._project_root_for(m.group(1))
+                if not root: return self._send_json({"ok": False, "error": "project not found"}, status=404)
+                data = self._read_json()
+                try:
+                    n = int(data.get("n", -1))
+                except Exception:
+                    n = -1
+                if n < 0:
+                    return self._send_json({"ok": False, "error": "n must be a non-negative integer"})
+                self._send_json(op_prune(root, n)); return
+
+            m = re.match(r"^/api/projects/([^/]+)/clean$", p)
+            if m:
+                root = self._project_root_for(m.group(1))
+                if not root: return self._send_json({"ok": False, "error": "project not found"}, status=404)
+                self._send_json(op_clean(root)); return
+
+            m = re.match(r"^/api/projects/([^/]+)/undo$", p)
+            if m:
+                root = self._project_root_for(m.group(1))
+                if not root: return self._send_json({"ok": False, "error": "project not found"}, status=404)
+                self._send_json(op_undo(root)); return
+
+            self.send_error(404)
+        except Exception as e:
+            self._send_json({"ok": False, "error": str(e)}, status=500)
+
+    def _serve_file(self, path, ctype):
+        if not path.exists():
+            self.send_error(404)
+            return
+        self._send_text(path.read_bytes(), 200, ctype)
+
+
+def cmd_ui(args):
+    if not WEB_DIR.exists() or not (WEB_DIR / "index.html").exists():
+        die(f"web UI not installed at {WEB_DIR}\n"
+            f"run the installer or copy web/ from the source tree.")
+    # Register current project (best-effort) so it shows up in the picker.
+    if is_git_repo():
+        register_project(project_root())
+    port = args.port or find_free_port()
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", port), UIHandler)
+    url = f"http://127.0.0.1:{port}"
+    print(f"ckpt UI: {url}")
+    print(f"  data dir: {USER_DATA_DIR}")
+    print(f"  Ctrl+C to stop")
+    if not args.no_open:
+        threading.Timer(0.3, lambda: webbrowser.open(url)).start()
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\nstopping…")
+        server.shutdown()
+
+
+# ---------------- main dispatch ----------------
+
+def main():
+    parser = argparse.ArgumentParser(prog="ckpt", description="Per-turn git-ref checkpoints for Claude Code.")
+    parser.add_argument("--hook", choices=["save-prompt", "checkpoint"],
+                        help=argparse.SUPPRESS)
+    sub = parser.add_subparsers(dest="cmd")
+
+    sub.add_parser("list", help="List checkpoints").set_defaults(func=lambda a: cmd_list())
+    sub.add_parser("ls",   help=argparse.SUPPRESS).set_defaults(func=lambda a: cmd_list())
+
+    p = sub.add_parser("show", help="Show a checkpoint's diff")
+    p.add_argument("ref")
+    p.set_defaults(func=cmd_show)
+
+    p = sub.add_parser("restore", help="Restore a checkpoint")
+    p.add_argument("ref", nargs="?", default=None)
+    p.add_argument("path", nargs="?", default=None)
+    p.set_defaults(func=cmd_restore)
+
+    sub.add_parser("undo",   help="Roll back the last restore").set_defaults(func=lambda a: cmd_undo())
+    sub.add_parser("latest", help="Show newest checkpoint").set_defaults(func=lambda a: cmd_latest())
+    sub.add_parser("clean",  help="Delete all checkpoints").set_defaults(func=lambda a: cmd_clean())
+
+    p = sub.add_parser("delete", help="Delete one checkpoint"); p.add_argument("ref"); p.set_defaults(func=cmd_delete)
+    sub.add_parser("rm", help=argparse.SUPPRESS).set_defaults(func=lambda a: cmd_delete(a)) if False else None  # placeholder
+
+    p = sub.add_parser("prune", help="Keep only N newest"); p.add_argument("n", type=int); p.set_defaults(func=cmd_prune)
+
+    p = sub.add_parser("ui", help="Launch the web UI")
+    p.add_argument("--port", type=int, default=None)
+    p.add_argument("--no-open", action="store_true")
+    p.set_defaults(func=cmd_ui)
+
+    sub.add_parser("projects", help="List known projects").set_defaults(func=lambda a: cmd_projects())
+    sub.add_parser("migrate",  help="Migrate old in-repo .claude/ setup to ckpt").set_defaults(func=lambda a: cmd_migrate())
+
+    args = parser.parse_args()
+
+    if args.hook == "save-prompt":
+        hook_save_prompt(); return
+    if args.hook == "checkpoint":
+        hook_checkpoint(); return
+
+    if not args.cmd:
+        parser.print_help()
+        return
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()
