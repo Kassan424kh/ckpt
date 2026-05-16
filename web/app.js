@@ -6,6 +6,54 @@ import {
   html, render,
   useState, useEffect, useCallback, useRef,
 } from 'https://esm.sh/htm@3.1.1/preact/standalone';
+import hljs from 'https://esm.sh/highlight.js@11.9.0';
+
+// ---------- syntax highlighting ----------
+
+const EXT_TO_LANG = {
+  swift: 'swift',
+  js: 'javascript', mjs: 'javascript', cjs: 'javascript', jsx: 'javascript',
+  ts: 'typescript', tsx: 'typescript',
+  py: 'python', pyw: 'python',
+  sh: 'bash', bash: 'bash', zsh: 'bash',
+  rb: 'ruby',
+  rs: 'rust',
+  go: 'go',
+  java: 'java',
+  kt: 'kotlin', kts: 'kotlin',
+  c: 'c', h: 'c',
+  cpp: 'cpp', cc: 'cpp', cxx: 'cpp', hpp: 'cpp', hxx: 'cpp',
+  m: 'objectivec', mm: 'objectivec',
+  metal: 'cpp',
+  json: 'json',
+  yaml: 'yaml', yml: 'yaml',
+  toml: 'ini',
+  ini: 'ini', conf: 'ini', cfg: 'ini',
+  xml: 'xml', html: 'xml', htm: 'xml', svg: 'xml', plist: 'xml',
+  css: 'css', scss: 'scss', sass: 'scss',
+  md: 'markdown', markdown: 'markdown',
+  sql: 'sql',
+  dockerfile: 'dockerfile',
+};
+
+function getLanguage(path) {
+  if (!path) return null;
+  const base = path.split('/').pop() || '';
+  if (base.toLowerCase() === 'dockerfile') return 'dockerfile';
+  const ext = (base.split('.').pop() || '').toLowerCase();
+  const lang = EXT_TO_LANG[ext] || null;
+  if (lang && hljs.getLanguage(lang)) return lang;
+  return null;
+}
+
+function highlightCode(code, lang) {
+  if (!lang || !code) return null;
+  try {
+    return hljs.highlight(code, { language: lang, ignoreIllegals: true }).value;
+  } catch (e) {
+    return null;
+  }
+}
 
 // ---------- API client ----------
 
@@ -72,8 +120,9 @@ function Modal({ title, children, actions, onClose }) {
 function Header({ branch, hasUndo, live, onRefresh, onPrune, onClean, onUndo }) {
   return html`
     <header>
-      <span class="title">ckpt — Claude checkpoints</span>
-      <span class="branch">${branch ? `(${branch})` : ''}</span>
+      <span class="glyph">✦</span>
+      <span class="title">ckpt</span>
+      <span class="branch">${branch ? `${branch}` : ''}</span>
       <span class="spacer"></span>
       <span class=${classes('live', live)}>${live === 'active' ? 'live' : live === 'offline' ? 'offline' : 'idle'}</span>
       <button onClick=${onRefresh} title="Refresh now">↻ Refresh</button>
@@ -238,26 +287,36 @@ function FilesList({ files, selectedFile, ckptId, ckpt, onSelect, onRestoreFile 
 
 // ---------- diff viewer ----------
 
-function parseDiff(text) {
+function parseDiff(text, lang) {
   const lines = text.split('\n');
   let ins = 0, del = 0;
   let inHunk = false, oldLine = 0, newLine = 0;
   const rendered = lines.map((line, i) => {
     let cls = 'meta', gOld = '', gNew = '';
+    let prefix = '', code = line, kind = 'meta';
+
     if (/^(diff |index |--- |\+\+\+ |new file|deleted file|rename |similarity |Binary )/.test(line)) {
-      cls = 'meta file-header'; inHunk = false;
+      cls = 'meta file-header'; inHunk = false; kind = 'meta';
     } else if (line.startsWith('@@')) {
-      cls = 'hunk'; inHunk = true;
+      cls = 'hunk'; inHunk = true; kind = 'hunk';
       const m = line.match(/@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/);
       if (m) { oldLine = parseInt(m[1], 10); newLine = parseInt(m[2], 10); }
     } else if (inHunk && line.startsWith('+')) {
       cls = 'add'; ins++; gNew = newLine++;
+      prefix = '+'; code = line.slice(1); kind = 'add';
     } else if (inHunk && line.startsWith('-')) {
       cls = 'del'; del++; gOld = oldLine++;
+      prefix = '-'; code = line.slice(1); kind = 'del';
     } else if (inHunk) {
       gOld = oldLine++; gNew = newLine++;
+      prefix = line[0] || ' '; code = line.slice(1); kind = 'context';
     }
-    return { i, cls, gOld, gNew, line };
+
+    // Highlight only code lines (add/del/context). Meta/hunk lines stay literal.
+    const highlighted = (lang && (kind === 'add' || kind === 'del' || kind === 'context'))
+      ? highlightCode(code, lang) : null;
+
+    return { i, cls, gOld, gNew, prefix, code, highlighted, raw: line, kind };
   });
   return { lines: rendered, ins, del };
 }
@@ -280,7 +339,8 @@ function DiffViewer({ path, text }) {
       <div class="col-body"><div class="empty">(no diff — file may be unchanged or binary)</div></div>
     </div>
   `;
-  const { lines, ins, del } = parseDiff(text);
+  const lang = getLanguage(path);
+  const { lines, ins, del } = parseDiff(text, lang);
   return html`
     <div class="col">
       <div class="diff-toolbar">
@@ -291,13 +351,28 @@ function DiffViewer({ path, text }) {
       </div>
       <div class="col-body">
         <div class="diff">
-          ${lines.map(l => html`
-            <div key=${l.i} class=${classes('diff-line', l.cls)}>
-              <span class="gutter">${l.gOld}</span>
-              <span class="gutter">${l.gNew}</span>
-              <span class="content">${l.line || ' '}</span>
-            </div>
-          `)}
+          ${lines.map(l => {
+            if (l.kind === 'meta' || l.kind === 'hunk') {
+              return html`
+                <div key=${l.i} class=${classes('diff-line', l.cls)}>
+                  <span class="gutter"></span>
+                  <span class="gutter"></span>
+                  <span class="content"><span class="code">${l.raw || ' '}</span></span>
+                </div>
+              `;
+            }
+            return html`
+              <div key=${l.i} class=${classes('diff-line', l.cls)}>
+                <span class="gutter">${l.gOld}</span>
+                <span class="gutter">${l.gNew}</span>
+                <span class="content"><span class="prefix">${l.prefix}</span>${
+                  l.highlighted
+                    ? html`<span class="code hljs" dangerouslySetInnerHTML=${{ __html: l.highlighted || ' ' }}></span>`
+                    : html`<span class="code">${l.code || ' '}</span>`
+                }</span>
+              </div>
+            `;
+          })}
         </div>
       </div>
     </div>
