@@ -513,6 +513,21 @@ function App() {
 
   // ---------- modals ----------
 
+  const openRestoreFile = (path) => setModal({
+    title: 'Restore single file?',
+    body: html`
+      <p><code>${path}</code></p>
+      <p class="muted">Replace your current copy of this file with the version from
+        checkpoint <code>${selectedCkpt}</code>.</p>
+      <p class="muted">Other files unchanged. No checkpoints are deleted.</p>
+    `,
+    actions: html`
+      <button onClick=${() => setModal(null)}>Cancel</button>
+      <button class="primary"
+              onClick=${() => { setModal(null); doRestoreFile(path); }}>Restore file</button>
+    `,
+  });
+
   const openRestore = (c) => setModal({
     title: 'Restore to checkpoint',
     body: html`
@@ -622,7 +637,7 @@ function App() {
               ckptId=${selectedCkpt}
               ckpt=${selCkpt}
               onSelect=${(p) => selectFile(selectedCkpt, p)}
-              onRestoreFile=${doRestoreFile}
+              onRestoreFile=${openRestoreFile}
             />
             <${DiffViewer} path=${selectedFile} text=${diff}/>
           </div>
