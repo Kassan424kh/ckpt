@@ -292,10 +292,13 @@ function parseDiff(text, lang) {
   let ins = 0, del = 0;
   let inHunk = false, oldLine = 0, newLine = 0;
   const rendered = lines.map((line, i) => {
+    // Skip redundant diff headers — the file path is already in the toolbar.
+    if (/^(diff --git |index |--- |\+\+\+ )/.test(line)) return null;
+
     let cls = 'meta', gOld = '', gNew = '';
     let prefix = '', code = line, kind = 'meta';
 
-    if (/^(diff |index |--- |\+\+\+ |new file|deleted file|rename |similarity |Binary )/.test(line)) {
+    if (/^(new file|deleted file|rename |similarity |Binary )/.test(line)) {
       cls = 'meta file-header'; inHunk = false; kind = 'meta';
     } else if (line.startsWith('@@')) {
       cls = 'hunk'; inHunk = true; kind = 'hunk';
@@ -317,7 +320,7 @@ function parseDiff(text, lang) {
       ? highlightCode(code, lang) : null;
 
     return { i, cls, gOld, gNew, prefix, code, highlighted, raw: line, kind };
-  });
+  }).filter(Boolean);
   return { lines: rendered, ins, del };
 }
 
