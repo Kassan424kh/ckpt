@@ -136,10 +136,11 @@ function Header({ branch, live, onRefresh, onSettings }) {
 
 const SETTINGS_KEY = 'ckpt.settings';
 function loadSettings() {
+  const defaults = { deleteLater: false, autoUpdate: false };
   try {
     const s = JSON.parse(localStorage.getItem(SETTINGS_KEY) || '{}');
-    return { deleteLater: false, ...s };
-  } catch { return { deleteLater: false }; }
+    return { ...defaults, ...s };
+  } catch { return defaults; }
 }
 function saveSettings(s) {
   try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(s)); } catch {}
@@ -163,6 +164,21 @@ function SettingsModal({ settings, updateSettings, hasUndo, onClose, onPrune, on
           When restoring to an older checkpoint, also remove every checkpoint
           created after it. Off by default — keep this off to preserve a
           timeline you can navigate forward through.
+        </p>
+      </div>
+      <div class="settings-section">
+        <div class="settings-section-title">Updates</div>
+        <label class="settings-toggle">
+          <input type="checkbox"
+                 checked=${settings.autoUpdate}
+                 onChange=${(e) => updateSettings({ autoUpdate: e.currentTarget.checked })}/>
+          <span>Auto-update when a new version is available</span>
+        </label>
+        <p class="settings-help">
+          When enabled, the latest commit on <code>main</code> is downloaded
+          and applied as soon as the update check detects it (every 30 min,
+          plus once on load). The page reloads automatically after each
+          update. Each SHA is attempted only once per session.
         </p>
       </div>
       <div class="settings-section">
@@ -582,6 +598,23 @@ function App() {
     if (updateInfo?.latest) localStorage.setItem('ckpt.dismissedUpdate', updateInfo.latest);
     setUpdateInfo({ ...updateInfo, behind: 0 });  // hide locally
   }, [updateInfo]);
+
+  // Auto-update: when the toggle is on and a new SHA appears, run doUpdate()
+  // once per session per SHA. Re-tries on a different SHA, but never loops
+  // on the same failed one.
+  const autoTriedRef = useRef(null);
+  useEffect(() => {
+    if (!settings.autoUpdate) return;
+    if (!updateInfo?.ok) return;
+    if (!updateInfo.latest || (updateInfo.behind || 0) < 1) return;
+    if (updateBusy) return;
+    if (autoTriedRef.current === updateInfo.latest) return;
+    const dismissed = localStorage.getItem('ckpt.dismissedUpdate');
+    if (dismissed === updateInfo.latest) return;
+    autoTriedRef.current = updateInfo.latest;
+    toast('auto-update: new version detected', 'info');
+    doUpdate();
+  }, [settings.autoUpdate, updateInfo, updateBusy, doUpdate]);
   useEffect(() => {
     lastIdsRef.current = new Set();
     setCheckpoints([]); setSelectedCkpt(null);
