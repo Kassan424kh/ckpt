@@ -215,6 +215,54 @@ def get_project(project_id):
 
 # ---------------- helpers shared by hooks + UI ----------------
 
+# Files we deliberately keep out of every snapshot — they're per-machine
+# state and including them would clobber prompt history on restore.
+_DB_EXCLUDE_PATHS = (
+    PROJECT_DB_REL,                      # .claude/checkpoints.db
+    PROJECT_DB_REL + "-journal",
+    PROJECT_DB_REL + "-wal",
+    PROJECT_DB_REL + "-shm",
+)
+
+
+def _strip_db_from_index(root, env):
+    """After `git add -A` into the temp index, drop the SQLite DB files."""
+    subprocess.run(
+        ["git", "rm", "--cached", "--ignore-unmatch", "--", *_DB_EXCLUDE_PATHS],
+        env=env, capture_output=True, cwd=root,
+    )
+
+
+def _save_db(root):
+    """Snapshot the current project DB to a temp file. Returns the temp path or None."""
+    db_path = project_db_path(root)
+    if not db_path.exists():
+        return None
+    bk = tempfile.NamedTemporaryFile(delete=False, prefix="ckpt-db-", suffix=".db")
+    bk.close()
+    try:
+        shutil.copyfile(str(db_path), bk.name)
+        return bk.name
+    except Exception:
+        try: os.unlink(bk.name)
+        except Exception: pass
+        return None
+
+
+def _restore_db(root, backup_path):
+    """Put the DB back to its pre-op state. backup_path None => ensure DB absent."""
+    db_path = project_db_path(root)
+    if backup_path:
+        try:
+            shutil.copyfile(backup_path, str(db_path))
+        except Exception:
+            pass
+        try: os.unlink(backup_path)
+        except Exception: pass
+    elif db_path.exists():
+        try: db_path.unlink()
+        except Exception: pass
+
 def make_snapshot_commit(root, message):
     """Snapshot working tree (incl. untracked, respecting .gitignore) into a
     parentless-or-from-HEAD commit. Live index/worktree untouched.
@@ -235,6 +283,7 @@ def make_snapshot_commit(root, message):
         env = os.environ.copy()
         env["GIT_INDEX_FILE"] = tmp.name
         subprocess.run(["git", "add", "-A"], env=env, capture_output=True, cwd=root)
+        _strip_db_from_index(root, env)
         r = subprocess.run(["git", "write-tree"], env=env, capture_output=True, text=True, cwd=root)
         if r.returncode != 0:
             return None
@@ -372,12 +421,22 @@ def op_restore_full(root, ref, delete_later=False):
     # Opt-in (`delete_later=True`): legacy behavior — also remove every
     # checkpoint whose timestamp sorts after the target. The pre-restore
     # safety snapshot is always saved so `ckpt undo` can recover state.
+    #
+    # The project's SQLite DB is preserved across the read-tree: older
+    # checkpoints (created before the DB-exclusion fix) embed a stale copy
+    # of the DB in their tree, and a naive read-tree would wipe prompt
+    # history for the restored checkpoint and every later one.
     safety = make_snapshot_commit(root, f"pre-restore safety ({time.strftime('%Y-%m-%d %H:%M:%S')})")
     if safety:
         git("update-ref", TRASH_REF, safety, cwd=root)
+
+    db_backup = _save_db(root)
     _, err, code = git("read-tree", "--reset", "-u", ref, cwd=root)
     if code != 0:
+        # Restore DB so we don't leave half-baked state behind.
+        _restore_db(root, db_backup)
         return {"ok": False, "error": (err or "read-tree failed").strip()}
+    _restore_db(root, db_backup)
 
     deleted = 0
     if delete_later:
@@ -449,9 +508,14 @@ def op_clean(root):
 def op_undo(root):
     if not has_trash(root):
         return {"ok": False, "error": "no recent restore to undo"}
+    # Same DB-preservation discipline as op_restore_full: an older safety
+    # snapshot might embed the DB; don't let it clobber current prompt history.
+    db_backup = _save_db(root)
     _, err, code = git("read-tree", "--reset", "-u", TRASH_REF, cwd=root)
     if code != 0:
+        _restore_db(root, db_backup)
         return {"ok": False, "error": err.strip() or "read-tree failed"}
+    _restore_db(root, db_backup)
     return {"ok": True}
 
 
@@ -553,6 +617,7 @@ def hook_checkpoint():
         env = os.environ.copy()
         env["GIT_INDEX_FILE"] = tmp.name
         subprocess.run(["git", "add", "-A"], env=env, capture_output=True, cwd=root)
+        _strip_db_from_index(root, env)
         r = subprocess.run(["git", "write-tree"], env=env, capture_output=True, text=True, cwd=root)
         if r.returncode != 0:
             return
