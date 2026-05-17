@@ -324,13 +324,19 @@ button.danger.solid:hover:not(:disabled) { background: var(--warn); border-color
   color: var(--muted);
   margin-bottom: 5px;
 }
-.checkpoint .ckpt-index {
+/* Shared #N badge for checkpoints, projects, and files. Muted monospace. */
+.list-index {
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
   font-size: 10px;
   color: var(--muted-soft);
   font-weight: 600;
   letter-spacing: 0.02em;
+  flex-shrink: 0;
 }
+/* In .name and .file the badge sits inline before the label, so give it a
+ * small right-margin for breathing room. */
+.project .name .list-index,
+.file .list-index { margin-right: 6px; }
 .checkpoint .when { color: var(--accent-light); }
 .checkpoint .id {
   font-family: ui-monospace, monospace;

@@ -233,7 +233,7 @@ function ProjectList({
   }
   return html`
     <div>
-      ${projects.map(p => html`
+      ${projects.map((p, i) => html`
         <div key=${p.id}
              class=${classes('project', selectedId === p.id && 'selected', !p.exists && 'missing')}
              onClick=${() => p.exists && onSelect(p.id)}
@@ -245,7 +245,7 @@ function ProjectList({
               <span class="icon sm">more_vert</span>
             </button>
           ` : null}
-          <div class="name">${p.name || p.path.split('/').pop()}</div>
+          <div class="name"><span class="list-index">#${i + 1}</span>${p.name || p.path.split('/').pop()}</div>
           <div class="path">${p.path}</div>
           ${openMenuId === p.id ? html`
             <${ProjectMenu}
@@ -286,7 +286,7 @@ function CheckpointRow({ ckpt, index, total, selected, isNew, onSelect, onRestor
     <div class=${classes('checkpoint', selected && 'selected', isNew && 'new')}
          onClick=${onSelect}>
       <div class="row1">
-        <span class="ckpt-index">#${index}</span>
+        <span class="list-index">#${index}</span>
         <span class="when">${ckpt.when}</span>
         <span class="id">${ckpt.id}</span>
       </div>
@@ -385,12 +385,13 @@ function FilesList({ files, selectedFile, ckptId, ckpt, onSelect, onRestoreFile 
           ? html`<div class="empty">select a checkpoint</div>`
           : !files.length
             ? html`<div class="empty">no files changed in this checkpoint</div>`
-            : files.map(f => {
+            : files.map((f, i) => {
                 const s = (f.status || '?')[0];
                 return html`
                   <div key=${f.path}
                        class=${classes('file', selectedFile === f.path && 'selected')}
                        onClick=${() => onSelect(f.path)}>
+                    <span class="list-index">#${i + 1}</span>
                     <span class=${`status ${s}`}>${s}</span>
                     <span class="path" title=${f.path}>${f.path}</span>
                     <button class="action"
