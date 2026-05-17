@@ -52,6 +52,18 @@ echo "==> Installed:"
 echo "    $INSTALL_BIN/ckpt"
 echo "    $INSTALL_DATA/web/"
 
+# Record the installed commit SHA so the UI can detect new releases.
+if [ -d "$SRC_DIR/.git" ] && command -v git >/dev/null 2>&1; then
+  SHA="$(git -C "$SRC_DIR" rev-parse HEAD 2>/dev/null || true)"
+else
+  # Remote install — query GitHub for current main SHA via git ls-remote (no API quota cost).
+  SHA="$(git ls-remote "https://github.com/${REPO}.git" "refs/heads/${REF}" 2>/dev/null | cut -f1)"
+fi
+if [ -n "$SHA" ]; then
+  printf '%s\n' "$SHA" > "$INSTALL_DATA/VERSION"
+  echo "    $INSTALL_DATA/VERSION ($SHA)"
+fi
+
 # 3) Merge hook registration into ~/.claude/settings.json (idempotent).
 mkdir -p "$(dirname "$CLAUDE_SETTINGS")"
 python3 - "$CLAUDE_SETTINGS" <<'PY'

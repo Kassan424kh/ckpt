@@ -426,6 +426,49 @@ function DiffViewer({ path, text }) {
   `;
 }
 
+// ---------- update banner ----------
+
+const DISMISSED_KEY = 'ckpt.dismissedUpdate';
+
+function UpdateBanner({ info, busy, onUpdate, onDismiss }) {
+  if (!info || !info.ok || !info.latest || info.behind < 1) return null;
+  const dismissed = localStorage.getItem(DISMISSED_KEY);
+  if (dismissed && dismissed === info.latest) return null;
+
+  const commits = (info.commits || []).slice(0, 8);
+  return html`
+    <div class="update-banner">
+      <div class="update-banner-row">
+        <span class="icon">system_update</span>
+        <span class="update-banner-title">Update available</span>
+        <span class="update-banner-meta">
+          ${info.behind} commit${info.behind === 1 ? '' : 's'} ahead
+          ${info.current ? html` · current ${info.current.slice(0, 7)}` : null}
+          ${info.latest  ? html` → latest ${info.latest.slice(0, 7)}` : null}
+        </span>
+        <span class="spacer"></span>
+        <button onClick=${onDismiss} disabled=${busy}>Dismiss</button>
+        <button class="primary" onClick=${onUpdate} disabled=${busy}>
+          ${busy ? html`<span class="icon">progress_activity</span>Updating…` : html`<span class="icon">download</span>Update now`}
+        </button>
+      </div>
+      ${commits.length ? html`
+        <div class="update-banner-changes">
+          <div class="update-banner-changes-label">Recent changes</div>
+          <ul class="update-banner-changelist">
+            ${commits.map(c => html`
+              <li key=${c.sha}>
+                <span class="change-sha">${c.sha}</span>
+                <span class="change-subject">${c.subject || '(no message)'}</span>
+              </li>
+            `)}
+          </ul>
+        </div>
+      ` : null}
+    </div>
+  `;
+}
+
 // ---------- main App ----------
 
 function App() {
@@ -454,6 +497,10 @@ function App() {
   // settings (persisted to localStorage)
   const [settings, setSettingsState] = useState(loadSettings);
   const [showSettings, setShowSettings] = useState(false);
+
+  // self-update
+  const [updateInfo, setUpdateInfo] = useState(null);
+  const [updateBusy, setUpdateBusy] = useState(false);
   const updateSettings = useCallback((patch) => {
     setSettingsState(prev => { const s = { ...prev, ...patch }; saveSettings(s); return s; });
   }, []);
@@ -509,6 +556,32 @@ function App() {
   // ---------- effects ----------
 
   useEffect(() => { refreshProjects(); }, []);
+
+  // Update check: once on mount, then every 30 minutes.
+  useEffect(() => {
+    const fetchUpdates = () => api.get('/api/updates').then(setUpdateInfo).catch(() => {});
+    fetchUpdates();
+    const t = setInterval(fetchUpdates, 30 * 60 * 1000);
+    return () => clearInterval(t);
+  }, []);
+
+  const doUpdate = useCallback(async () => {
+    setUpdateBusy(true);
+    toast('downloading update…', 'info');
+    const r = await api.post('/api/update').catch(e => ({ ok: false, error: String(e) }));
+    setUpdateBusy(false);
+    if (r?.ok) {
+      toast(`updated to ${r.version ? r.version.slice(0, 7) : 'main'}; reloading…`, 'ok');
+      setTimeout(() => window.location.reload(), 1200);
+    } else {
+      toast(`update failed: ${r?.error || 'unknown error'}`, 'err');
+    }
+  }, []);
+
+  const dismissUpdate = useCallback(() => {
+    if (updateInfo?.latest) localStorage.setItem('ckpt.dismissedUpdate', updateInfo.latest);
+    setUpdateInfo({ ...updateInfo, behind: 0 });  // hide locally
+  }, [updateInfo]);
   useEffect(() => {
     lastIdsRef.current = new Set();
     setCheckpoints([]); setSelectedCkpt(null);
@@ -742,6 +815,12 @@ function App() {
         live=${liveState}
         onRefresh=${() => { refreshCkpts(true); refreshProjects(); }}
         onSettings=${() => setShowSettings(true)}
+      />
+      <${UpdateBanner}
+        info=${updateInfo}
+        busy=${updateBusy}
+        onUpdate=${doUpdate}
+        onDismiss=${dismissUpdate}
       />
       <div class="main">
         <div class="col">
