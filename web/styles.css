@@ -215,7 +215,7 @@ button.danger.solid:hover:not(:disabled) { background: var(--warn); border-color
 
 /* ---- projects ---- */
 .project {
-  padding: 10px 14px 10px 32px;
+  padding: 10px 32px 10px 14px;
   border-bottom: 1px solid var(--border2);
   cursor: pointer;
   transition: background 0.12s;
@@ -225,7 +225,7 @@ button.danger.solid:hover:not(:disabled) { background: var(--warn); border-color
 .project.selected {
   background: var(--accent-bg);
   border-left: 2px solid var(--accent);
-  padding-left: 30px;
+  padding-left: 12px;
 }
 .project.missing { opacity: 0.45; }
 .project .name { font-weight: 500; color: var(--text); font-size: 12px; }
@@ -245,7 +245,7 @@ button.danger.solid:hover:not(:disabled) { background: var(--warn); border-color
 .project .kebab {
   position: absolute;
   top: 6px;
-  left: 4px;
+  right: 4px;
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -261,11 +261,11 @@ button.danger.solid:hover:not(:disabled) { background: var(--warn); border-color
 .project:hover .kebab, .project.selected .kebab { opacity: 1; }
 .project .kebab:hover { background: var(--panel3); color: var(--text); }
 
-/* kebab dropdown */
+/* kebab dropdown — anchored to the right edge so it doesn't clip out of the column */
 .kebab-menu {
   position: absolute;
   top: 32px;
-  left: 4px;
+  right: 4px;
   background: var(--panel2);
   border: 1px solid var(--border);
   border-radius: 6px;
