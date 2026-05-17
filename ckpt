@@ -976,6 +976,8 @@ def cmd_migrate():
 # ---------------- update check / self-update ----------------
 
 _update_cache = {}  # { 'data': {...}, 'ts': epoch }
+_running_server  = None   # set by cmd_ui; consulted by _do_restart
+_running_ui_port = None   # set by cmd_ui
 
 
 def installed_version():
@@ -1097,9 +1099,42 @@ def op_self_update():
             VERSION_FILE.write_text(sha + "\n")
 
         _update_cache.clear()
-        return {"ok": True, "version": sha}
+        # User-authorized: after a successful file replacement, restart the
+        # running ckpt ui server so the new Python takes effect for the next
+        # request. The HTTP response below flushes first; the restart thread
+        # waits a moment then execs a fresh process on the same port.
+        _schedule_restart()
+        return {"ok": True, "version": sha, "restarting": _running_server is not None}
     except Exception as e:
         return {"ok": False, "error": str(e)}
+
+
+def _schedule_restart():
+    """Kick off a restart in a background thread, after the current HTTP
+    response has been sent. No-op outside an active `ckpt ui` server."""
+    if _running_server is None:
+        return
+    threading.Thread(target=_do_restart, daemon=True).start()
+
+
+def _do_restart():
+    # Give the current handler thread time to finish writing its response.
+    time.sleep(0.5)
+    try:
+        if _running_server is not None:
+            _running_server.shutdown()
+            _running_server.server_close()
+    except Exception:
+        pass
+    time.sleep(0.15)  # let the OS release the listening socket
+    script = os.path.abspath(sys.argv[0])
+    argv = [sys.executable, script, "ui", "--no-open"]
+    if _running_ui_port:
+        argv.extend(["--port", str(_running_ui_port)])
+    try:
+        os.execv(sys.executable, argv)
+    except Exception:
+        os._exit(1)
 
 
 # ---------------- UI server ----------------
@@ -1289,8 +1324,11 @@ def cmd_ui(args):
     # Register current project (best-effort) so it shows up in the picker.
     if is_git_repo():
         register_project(project_root())
+    global _running_server, _running_ui_port
     port = args.port or find_free_port()
     server = http.server.ThreadingHTTPServer(("127.0.0.1", port), UIHandler)
+    _running_server  = server
+    _running_ui_port = port
     url = f"http://127.0.0.1:{port}"
     print(f"ckpt UI: {url}")
     print(f"  data dir: {USER_DATA_DIR}")
@@ -1302,6 +1340,9 @@ def cmd_ui(args):
     except KeyboardInterrupt:
         print("\nstopping…")
         server.shutdown()
+    finally:
+        _running_server  = None
+        _running_ui_port = None
 
 
 # ---------------- main dispatch ----------------

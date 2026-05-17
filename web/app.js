@@ -635,12 +635,34 @@ function App() {
     setUpdateBusy(true);
     toast('downloading update…', 'info');
     const r = await api.post('/api/update').catch(e => ({ ok: false, error: String(e) }));
-    setUpdateBusy(false);
-    if (r?.ok) {
-      toast(`updated to ${r.version ? r.version.slice(0, 7) : 'main'}; reloading…`, 'ok');
-      setTimeout(() => window.location.reload(), 1200);
-    } else {
+    if (!r?.ok) {
+      setUpdateBusy(false);
       toast(`update failed: ${r?.error || 'unknown error'}`, 'err');
+      return;
+    }
+    const tag = r.version ? r.version.slice(0, 7) : 'main';
+    if (r.restarting) {
+      toast(`updated to ${tag}; restarting server…`, 'ok');
+      // Poll /api/version until the new server answers, then reload.
+      let tries = 0;
+      const max = 40;            // 40 * 500ms = 20s
+      const check = async () => {
+        if (tries++ >= max) {
+          setUpdateBusy(false);
+          toast('server didn\'t come back — reload manually', 'err');
+          return;
+        }
+        try {
+          const resp = await fetch('/api/version', { cache: 'no-store' });
+          if (resp.ok) { window.location.reload(); return; }
+        } catch {}
+        setTimeout(check, 500);
+      };
+      setTimeout(check, 800);    // give the new process a head start
+    } else {
+      setUpdateBusy(false);
+      toast(`updated to ${tag}; reloading…`, 'ok');
+      setTimeout(() => window.location.reload(), 1200);
     }
   }, []);
 
