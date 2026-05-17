@@ -121,13 +121,13 @@ function Modal({ title, body, children, actions, onClose }) {
 function Header({ branch, live, onRefresh, onSettings }) {
   return html`
     <header>
-      <span class="glyph">✦</span>
+      <span class="glyph"><span class="icon lg">auto_awesome</span></span>
       <span class="title">ckpt</span>
       <span class="branch">${branch ? `${branch}` : ''}</span>
       <span class="spacer"></span>
       <span class=${classes('live', live)}>${live === 'active' ? 'live' : live === 'offline' ? 'offline' : 'idle'}</span>
-      <button onClick=${onRefresh} title="Refresh now">↻ Refresh</button>
-      <button onClick=${onSettings} title="Settings (prune / undo / clean live here)">⚙ Settings</button>
+      <button onClick=${onRefresh} title="Refresh now"><span class="icon">refresh</span>Refresh</button>
+      <button onClick=${onSettings} title="Settings (prune / undo / clean live here)"><span class="icon">settings</span>Settings</button>
     </header>
   `;
 }
@@ -169,7 +169,7 @@ function SettingsModal({ settings, updateSettings, hasUndo, onClose, onPrune, on
         <div class="settings-section-title">Maintenance</div>
         <div class="settings-actions">
           <button onClick=${onPrune}>Prune…</button>
-          <button onClick=${onUndo} disabled=${!hasUndo} title=${hasUndo ? 'Roll back the last restore' : 'No restore to undo'}>↶ Undo</button>
+          <button onClick=${onUndo} disabled=${!hasUndo} title=${hasUndo ? 'Roll back the last restore' : 'No restore to undo'}><span class="icon">undo</span>Undo</button>
           <button class="danger solid" onClick=${onClean}>Clean all</button>
         </div>
       </div>
@@ -319,7 +319,7 @@ function FilesList({ files, selectedFile, ckptId, ckpt, onSelect, onRestoreFile 
                     <span class="path" title=${f.path}>${f.path}</span>
                     <button class="action"
                             title="Restore just this file"
-                            onClick=${(e) => { e.stopPropagation(); onRestoreFile(f.path); }}>⤴</button>
+                            onClick=${(e) => { e.stopPropagation(); onRestoreFile(f.path); }}><span class="icon sm">restore</span></button>
                   </div>
                 `;
               })
