@@ -362,25 +362,17 @@ def status_for(root):
 # ---------------- restore operations ----------------
 
 def op_restore_full(root, ref):
+    # Non-destructive: hard-reset the working tree to this checkpoint, but
+    # keep every later checkpoint intact so the user can restore forward
+    # if they change their mind. The safety snapshot still captures any
+    # uncommitted state that wasn't in a checkpoint yet, for `ckpt undo`.
     safety = make_snapshot_commit(root, f"pre-restore safety ({time.strftime('%Y-%m-%d %H:%M:%S')})")
     if safety:
         git("update-ref", TRASH_REF, safety, cwd=root)
     _, err, code = git("read-tree", "--reset", "-u", ref, cwd=root)
     if code != 0:
         return {"ok": False, "error": (err or "read-tree failed").strip()}
-
-    out, _, _ = git("for-each-ref", f"{REF_NS}/", "--format=%(refname)", cwd=root)
-    target_basename = ref.rsplit("/", 1)[-1]
-    deleted = 0
-    for r in out.splitlines():
-        if not r.strip():
-            continue
-        if r.rsplit("/", 1)[-1] > target_basename:
-            git("update-ref", "-d", r, cwd=root)
-            deleted += 1
-    # Cleanup SQLite rows for deleted refs
-    cleanup_orphan_rows(root)
-    return {"ok": True, "deleted": deleted, "safety": bool(safety)}
+    return {"ok": True, "safety": bool(safety)}
 
 
 def op_restore_file(root, ref, path):
@@ -807,10 +799,9 @@ def _confirm_full_restore(root, ref):
     for line in stat_out.splitlines():
         print(f"    {line}")
     print()
-    print("  This will:")
-    print("    1. Reset your working tree and index to this checkpoint")
-    print("    2. Delete all checkpoints created AFTER this one")
-    print(f"    3. Save the current state under '{TRASH_REF}' so you can 'ckpt undo'")
+    print("  This will reset your working tree and index to this checkpoint.")
+    print(f"  Current state is snapshotted to '{TRASH_REF}' so 'ckpt undo' can recover it.")
+    print("  Later checkpoints are kept — restore forward at any time.")
     print()
     ans = input("  proceed? [y/N] ").strip().lower()
     if ans != "y":
@@ -820,8 +811,6 @@ def _confirm_full_restore(root, ref):
     if not r["ok"]:
         die(r.get("error") or "restore failed")
     print(f"  restored to: {cid}")
-    if r["deleted"]:
-        print(f"  deleted {r['deleted']} later checkpoint(s)")
     if r.get("safety"):
         print("  to undo: ckpt undo")
 

@@ -61,7 +61,7 @@ Built with Preact + htm — no build step, single-file React-style components.
 ckpt list                       List checkpoints in the current project
 ckpt show <ref>                 Show diff of a checkpoint
 ckpt restore                    Interactive picker (fzf if installed)
-ckpt restore <ref>              Full restore + delete every later checkpoint
+ckpt restore <ref>              Hard-reset working tree to a checkpoint (later ones kept)
 ckpt restore <ref> <path>       Restore a single file only
 ckpt undo                       Roll back the last restore
 ckpt delete <ref>               Delete one checkpoint

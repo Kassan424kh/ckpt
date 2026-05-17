@@ -536,7 +536,7 @@ function App() {
     toast(`restoring to ${c.id}…`, 'info');
     const r = await api.post(`${apiBase(selectedProject)}/checkpoints/${encodeURIComponent(c.id)}/restore`);
     if (r?.ok) {
-      toast(`restored to ${c.id}; deleted ${r.deleted} later`, 'ok');
+      toast(`restored to ${c.id}`, 'ok');
       refreshCkpts(true);
     } else {
       toast(r?.error || 'restore failed', 'err');
@@ -611,8 +611,10 @@ function App() {
     body: html`
       <p><code>${c.id}</code></p>
       <p><strong>${c.message}</strong></p>
-      <p class="muted">This will reset your working tree and index to this checkpoint, and
-        <strong>delete every checkpoint created after it</strong>. A safety snapshot is saved so you can Undo.</p>
+      <p class="muted">Hard-resets your working tree and index to this checkpoint.
+        A safety snapshot of your current state is saved so you can Undo.</p>
+      <p class="muted">Later checkpoints are kept — you can restore forward
+        at any time if you change your mind.</p>
     `,
     actions: html`
       <button onClick=${() => setModal(null)}>Cancel</button>
