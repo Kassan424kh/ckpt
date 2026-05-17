@@ -4,6 +4,43 @@ Per-turn git-ref checkpoints for Claude Code — across multiple projects, with 
 
 Every assistant turn auto-snapshots your working tree into a private git ref namespace (`refs/claude-checkpoints/*`), labelled with the first line of your prompt. Snapshots survive auto-compaction, session restart, and machine reboot. Your working tree, index, and visible git history stay untouched.
 
+## Screenshots
+
+<table>
+  <tr>
+    <td width="50%" align="center">
+      <a href="docs/screenshots/main-ui.png">
+        <img src="docs/screenshots/main-ui.png" alt="Main UI — projects, checkpoints, prompt and diff" width="100%" />
+      </a>
+      <br/>
+      <sub>Main UI — projects, checkpoints, prompt &amp; diff</sub>
+    </td>
+    <td width="50%" align="center">
+      <a href="docs/screenshots/settings.png">
+        <img src="docs/screenshots/settings.png" alt="Settings dialog" width="100%" />
+      </a>
+      <br/>
+      <sub>Settings dialog</sub>
+    </td>
+  </tr>
+  <tr>
+    <td width="50%" align="center">
+      <a href="docs/screenshots/project-actions.png">
+        <img src="docs/screenshots/project-actions.png" alt="Per-project actions menu" width="100%" />
+      </a>
+      <br/>
+      <sub>Per-project actions</sub>
+    </td>
+    <td width="50%" align="center">
+      <a href="docs/screenshots/restore-dialog.png">
+        <img src="docs/screenshots/restore-dialog.png" alt="Restore to checkpoint confirmation" width="100%" />
+      </a>
+      <br/>
+      <sub>Restore confirmation</sub>
+    </td>
+  </tr>
+</table>
+
 ## Install (one line)
 
 ```sh
