@@ -324,6 +324,13 @@ button.danger.solid:hover:not(:disabled) { background: var(--warn); border-color
   color: var(--muted);
   margin-bottom: 5px;
 }
+.checkpoint .ckpt-index {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 10px;
+  color: var(--muted-soft);
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
 .checkpoint .when { color: var(--accent-light); }
 .checkpoint .id {
   font-family: ui-monospace, monospace;
@@ -352,9 +359,24 @@ button.danger.solid:hover:not(:disabled) { background: var(--warn); border-color
 .checkpoint .stats .del   { color: var(--warn); font-weight: 600; }
 .checkpoint .stats .sep   { color: var(--border); }
 .checkpoint .stats .files { color: var(--muted); }
-.checkpoint .actions { display: flex; gap: 6px; opacity: 0; transition: opacity 0.15s; }
+.checkpoint .actions {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  opacity: 0;
+  transition: opacity 0.15s;
+}
 .checkpoint:hover .actions, .checkpoint.selected .actions { opacity: 1; }
-.checkpoint .actions button { padding: 2px 10px; font-size: 11px; }
+.checkpoint .actions button { padding: 2px 8px; font-size: 11px; }
+.checkpoint .actions .action-spacer { flex: 1; }
+.checkpoint .actions .prune-here {
+  color: var(--muted);
+}
+.checkpoint .actions .prune-here:hover:not(:disabled) {
+  color: var(--text);
+  background: var(--panel3);
+}
+.checkpoint .actions .prune-here .icon { font-size: 13px; }
 
 /* ---- prompt pane ---- */
 .prompt-pane {

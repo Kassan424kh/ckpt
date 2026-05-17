@@ -279,39 +279,52 @@ function StatsRow({ stats }) {
   return html`<div class="stats">${withSeps}</div>`;
 }
 
-function CheckpointRow({ ckpt, selected, isNew, onSelect, onRestore, onDelete }) {
+function CheckpointRow({ ckpt, index, total, selected, isNew, onSelect, onRestore, onDelete, onPruneHere }) {
+  // The last visible row is the oldest; pruning there would keep everything → disable.
+  const isOldest = index === total;
   return html`
     <div class=${classes('checkpoint', selected && 'selected', isNew && 'new')}
          onClick=${onSelect}>
       <div class="row1">
+        <span class="ckpt-index">#${index}</span>
         <span class="when">${ckpt.when}</span>
         <span class="id">${ckpt.id}</span>
       </div>
       <div class="msg">${ckpt.message}</div>
       <${StatsRow} stats=${ckpt.stats} />
       <div class="actions">
-        <button class="primary" onClick=${(e) => { e.stopPropagation(); onRestore(); }}>Restore</button>
+        <button class="prune-here"
+                disabled=${isOldest}
+                title=${isOldest ? 'No older checkpoints' : `Delete every checkpoint older than this one — keeps the ${index} newest`}
+                onClick=${(e) => { e.stopPropagation(); onPruneHere(); }}>
+          <span class="icon sm">filter_list</span>Prune here
+        </button>
+        <span class="action-spacer"></span>
         <button class="danger"  onClick=${(e) => { e.stopPropagation(); onDelete();  }}>Delete</button>
+        <button class="primary" onClick=${(e) => { e.stopPropagation(); onRestore(); }}>Restore</button>
       </div>
     </div>
   `;
 }
 
-function CheckpointList({ checkpoints, selectedId, newIds, onSelect, onRestore, onDelete }) {
+function CheckpointList({ checkpoints, selectedId, newIds, onSelect, onRestore, onDelete, onPruneHere }) {
   if (!checkpoints.length) {
     return html`<div class="empty">no checkpoints yet — the Stop hook creates one after each turn</div>`;
   }
   return html`
     <div>
-      ${checkpoints.map(c => html`
+      ${checkpoints.map((c, i) => html`
         <${CheckpointRow}
           key=${c.id}
           ckpt=${c}
+          index=${i + 1}
+          total=${checkpoints.length}
           selected=${selectedId === c.id}
           isNew=${newIds.has(c.id)}
           onSelect=${() => onSelect(c.id)}
           onRestore=${() => onRestore(c)}
           onDelete=${() => onDelete(c)}
+          onPruneHere=${() => onPruneHere(c, i + 1)}
         />
       `)}
     </div>
@@ -987,6 +1000,24 @@ function App() {
     `,
   });
 
+  const openPruneHere = (checkpoint, index) => {
+    const total = checkpoints.length;
+    const deleted = total - index;
+    setModal({
+      title: 'Prune older checkpoints',
+      body: html`
+        <p>Keep the <strong>${index}</strong> newest checkpoint${index === 1 ? '' : 's'},
+          deleting <strong>${deleted}</strong> older one${deleted === 1 ? '' : 's'}.</p>
+        <p class="muted">Cutoff at <code>${checkpoint.id}</code> — <em>${checkpoint.message || '(no message)'}</em></p>
+        <p class="muted">Working tree unchanged. Not reversible.</p>
+      `,
+      actions: html`
+        <button onClick=${() => setModal(null)}>Cancel</button>
+        <button class="primary" onClick=${() => doPrune(index, selectedProject)}>Prune older</button>
+      `,
+    });
+  };
+
   const openCleanProject = (project) => setModal({
     title: html`Delete all checkpoints in <code>${project.name}</code>?`,
     body: html`
@@ -1085,6 +1116,7 @@ function App() {
               onSelect=${selectCheckpoint}
               onRestore=${openRestore}
               onDelete=${openDelete}
+              onPruneHere=${openPruneHere}
             />
           </div>
         </div>
