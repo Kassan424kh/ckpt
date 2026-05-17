@@ -616,6 +616,25 @@ button.danger.solid:hover:not(:disabled) { background: var(--warn); border-color
   margin: 8px 0 0;
   padding-left: 26px;
 }
+.settings-help.warn {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  background: rgba(232, 184, 96, 0.08);
+  border: 1px solid rgba(232, 184, 96, 0.22);
+  border-left: 3px solid var(--amber);
+  border-radius: 5px;
+  padding: 10px 12px;            /* overrides the 26px indent of base .settings-help */
+  margin: 10px 0 0;
+  color: var(--text-soft);
+}
+.settings-help.warn::before {
+  content: "⚠";
+  color: var(--amber);
+  flex-shrink: 0;
+  font-size: 13px;
+  line-height: 1.55;
+}
 .settings-actions {
   display: flex;
   gap: 8px;

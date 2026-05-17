@@ -159,7 +159,7 @@ function SettingsModal({ settings, updateSettings, hasUndo, onClose, onPrune, on
                  onChange=${(e) => updateSettings({ deleteLater: e.currentTarget.checked })}/>
           <span>Delete later checkpoints when restoring</span>
         </label>
-        <p class="settings-help">
+        <p class="settings-help warn">
           When restoring to an older checkpoint, also remove every checkpoint
           created after it. Off by default — keep this off to preserve a
           timeline you can navigate forward through.
