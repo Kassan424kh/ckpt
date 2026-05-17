@@ -98,7 +98,7 @@ function ToastWrap() {
 
 // ---------- modal ----------
 
-function Modal({ title, children, actions, onClose }) {
+function Modal({ title, body, children, actions, onClose }) {
   useEffect(() => {
     const onKey = (e) => { if (e.key === 'Escape') onClose(); };
     document.addEventListener('keydown', onKey);
@@ -108,6 +108,7 @@ function Modal({ title, children, actions, onClose }) {
     <div class="modal-bg" onClick=${(e) => { if (e.target === e.currentTarget) onClose(); }}>
       <div class="modal" role="dialog" aria-modal="true">
         <h2>${title}</h2>
+        ${body}
         ${children}
         <div class="actions">${actions}</div>
       </div>
@@ -117,7 +118,7 @@ function Modal({ title, children, actions, onClose }) {
 
 // ---------- header ----------
 
-function Header({ branch, hasUndo, live, onRefresh, onPrune, onClean, onUndo }) {
+function Header({ branch, live, onRefresh, onSettings }) {
   return html`
     <header>
       <span class="glyph">✦</span>
@@ -126,10 +127,53 @@ function Header({ branch, hasUndo, live, onRefresh, onPrune, onClean, onUndo }) 
       <span class="spacer"></span>
       <span class=${classes('live', live)}>${live === 'active' ? 'live' : live === 'offline' ? 'offline' : 'idle'}</span>
       <button onClick=${onRefresh} title="Refresh now">↻ Refresh</button>
-      <button onClick=${onPrune}>Prune…</button>
-      <button onClick=${onUndo} disabled=${!hasUndo} title="Roll back the last restore">↶ Undo</button>
-      <button class="danger" onClick=${onClean}>Clean</button>
+      <button onClick=${onSettings} title="Settings (prune / undo / clean live here)">⚙ Settings</button>
     </header>
+  `;
+}
+
+// ---------- settings ----------
+
+const SETTINGS_KEY = 'ckpt.settings';
+function loadSettings() {
+  try {
+    const s = JSON.parse(localStorage.getItem(SETTINGS_KEY) || '{}');
+    return { deleteLater: false, ...s };
+  } catch { return { deleteLater: false }; }
+}
+function saveSettings(s) {
+  try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(s)); } catch {}
+}
+
+function SettingsModal({ settings, updateSettings, hasUndo, onClose, onPrune, onUndo, onClean }) {
+  return html`
+    <${Modal}
+      title="Settings"
+      onClose=${onClose}
+      actions=${html`<button class="primary" onClick=${onClose}>Close</button>`}>
+      <div class="settings-section">
+        <div class="settings-section-title">Restore behavior</div>
+        <label class="settings-toggle">
+          <input type="checkbox"
+                 checked=${settings.deleteLater}
+                 onChange=${(e) => updateSettings({ deleteLater: e.currentTarget.checked })}/>
+          <span>Delete later checkpoints when restoring</span>
+        </label>
+        <p class="settings-help">
+          When restoring to an older checkpoint, also remove every checkpoint
+          created after it. Off by default — keep this off to preserve a
+          timeline you can navigate forward through.
+        </p>
+      </div>
+      <div class="settings-section">
+        <div class="settings-section-title">Maintenance</div>
+        <div class="settings-actions">
+          <button onClick=${onPrune}>Prune…</button>
+          <button onClick=${onUndo} disabled=${!hasUndo} title=${hasUndo ? 'Roll back the last restore' : 'No restore to undo'}>↶ Undo</button>
+          <button class="danger solid" onClick=${onClean}>Clean all</button>
+        </div>
+      </div>
+    <//>
   `;
 }
 
@@ -407,6 +451,13 @@ function App() {
   // modal
   const [modal, setModal] = useState(null);
 
+  // settings (persisted to localStorage)
+  const [settings, setSettingsState] = useState(loadSettings);
+  const [showSettings, setShowSettings] = useState(false);
+  const updateSettings = useCallback((patch) => {
+    setSettingsState(prev => { const s = { ...prev, ...patch }; saveSettings(s); return s; });
+  }, []);
+
   const lastIdsRef = useRef(new Set());
 
   // ---------- fetchers ----------
@@ -534,14 +585,21 @@ function App() {
   const doRestore = useCallback(async (c) => {
     setModal(null);
     toast(`restoring to ${c.id}…`, 'info');
-    const r = await api.post(`${apiBase(selectedProject)}/checkpoints/${encodeURIComponent(c.id)}/restore`);
+    const r = await api.post(
+      `${apiBase(selectedProject)}/checkpoints/${encodeURIComponent(c.id)}/restore`,
+      { delete_later: !!settings.deleteLater },
+    );
     if (r?.ok) {
-      toast(`restored to ${c.id}`, 'ok');
+      if (settings.deleteLater && r.deleted) {
+        toast(`restored to ${c.id}; deleted ${r.deleted} later`, 'ok');
+      } else {
+        toast(`restored to ${c.id}`, 'ok');
+      }
       refreshCkpts(true);
     } else {
       toast(r?.error || 'restore failed', 'err');
     }
-  }, [selectedProject, refreshCkpts]);
+  }, [selectedProject, settings.deleteLater, refreshCkpts]);
 
   const doDelete = useCallback(async (c) => {
     setModal(null);
@@ -681,12 +739,9 @@ function App() {
     <div class="app">
       <${Header}
         branch=${status.branch}
-        hasUndo=${status.has_undo}
         live=${liveState}
         onRefresh=${() => { refreshCkpts(true); refreshProjects(); }}
-        onPrune=${openPrune}
-        onClean=${openClean}
-        onUndo=${openUndo}
+        onSettings=${() => setShowSettings(true)}
       />
       <div class="main">
         <div class="col">
@@ -725,6 +780,17 @@ function App() {
       </div>
       <${ToastWrap}/>
       ${modal && html`<${Modal} ...${modal} onClose=${() => setModal(null)}/>`}
+      ${showSettings && html`
+        <${SettingsModal}
+          settings=${settings}
+          updateSettings=${updateSettings}
+          hasUndo=${status.has_undo}
+          onClose=${() => setShowSettings(false)}
+          onPrune=${() => { setShowSettings(false); openPrune(); }}
+          onUndo=${() => { setShowSettings(false); openUndo(); }}
+          onClean=${() => { setShowSettings(false); openClean(); }}
+        />
+      `}
     </div>
   `;
 }

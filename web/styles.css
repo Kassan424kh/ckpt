@@ -572,6 +572,61 @@ button.danger.solid:hover:not(:disabled) { background: var(--warn); border-color
   border-color: var(--accent);
 }
 
+/* ---- settings modal ---- */
+.settings-section {
+  margin-bottom: 18px;
+  padding-bottom: 18px;
+  border-bottom: 1px solid var(--border2);
+}
+.settings-section:last-of-type {
+  border-bottom: 0;
+  padding-bottom: 0;
+  margin-bottom: 4px;
+}
+.settings-section-title {
+  font-weight: 600;
+  font-size: 11px;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: var(--muted);
+  margin-bottom: 10px;
+}
+.settings-toggle {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  cursor: pointer;
+  user-select: none;
+  font-size: 13px;
+  color: var(--text);
+  padding: 4px 0;
+}
+.settings-toggle input[type=checkbox] {
+  width: 16px;
+  height: 16px;
+  margin: 0;
+  accent-color: var(--accent);
+  cursor: pointer;
+  flex-shrink: 0;
+}
+.settings-help {
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.55;
+  margin: 8px 0 0;
+  padding-left: 26px;
+}
+.settings-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.settings-actions button {
+  flex: 1;
+  padding: 8px 16px;
+  min-width: 110px;
+}
+
 /* ---- scrollbars ---- */
 ::-webkit-scrollbar { width: 9px; height: 9px; }
 ::-webkit-scrollbar-track { background: transparent; }

@@ -361,18 +361,32 @@ def status_for(root):
 
 # ---------------- restore operations ----------------
 
-def op_restore_full(root, ref):
-    # Non-destructive: hard-reset the working tree to this checkpoint, but
-    # keep every later checkpoint intact so the user can restore forward
-    # if they change their mind. The safety snapshot still captures any
-    # uncommitted state that wasn't in a checkpoint yet, for `ckpt undo`.
+def op_restore_full(root, ref, delete_later=False):
+    # Default: hard-reset the working tree to this checkpoint but keep every
+    # later checkpoint intact so the user can restore forward.
+    # Opt-in (`delete_later=True`): legacy behavior — also remove every
+    # checkpoint whose timestamp sorts after the target. The pre-restore
+    # safety snapshot is always saved so `ckpt undo` can recover state.
     safety = make_snapshot_commit(root, f"pre-restore safety ({time.strftime('%Y-%m-%d %H:%M:%S')})")
     if safety:
         git("update-ref", TRASH_REF, safety, cwd=root)
     _, err, code = git("read-tree", "--reset", "-u", ref, cwd=root)
     if code != 0:
         return {"ok": False, "error": (err or "read-tree failed").strip()}
-    return {"ok": True, "safety": bool(safety)}
+
+    deleted = 0
+    if delete_later:
+        out, _, _ = git("for-each-ref", f"{REF_NS}/", "--format=%(refname)", cwd=root)
+        target_basename = ref.rsplit("/", 1)[-1]
+        for r in out.splitlines():
+            if not r.strip():
+                continue
+            if r.rsplit("/", 1)[-1] > target_basename:
+                git("update-ref", "-d", r, cwd=root)
+                deleted += 1
+        cleanup_orphan_rows(root)
+
+    return {"ok": True, "deleted": deleted, "safety": bool(safety)}
 
 
 def op_restore_file(root, ref, path):
@@ -1006,7 +1020,8 @@ class UIHandler(http.server.BaseHTTPRequestHandler):
                 root = self._project_root_for(m.group(1))
                 if not root: return self._send_json({"ok": False, "error": "project not found"}, status=404)
                 ref = f"{REF_NS}/{m.group(2)}"
-                self._send_json(op_restore_full(root, ref)); return
+                data = self._read_json()
+                self._send_json(op_restore_full(root, ref, bool(data.get("delete_later", False)))); return
 
             m = re.match(r"^/api/projects/([^/]+)/checkpoints/([^/]+)/restore-file$", p)
             if m:
