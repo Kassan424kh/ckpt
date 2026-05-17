@@ -84,7 +84,19 @@ body {
   overflow: hidden;
 }
 #app { height: 100vh; }
-.app { display: grid; grid-template-rows: auto auto 1fr; height: 100%; }
+.app {
+  display: grid;
+  grid-template-rows: auto auto 1fr;
+  height: 100%;
+}
+/* Anchor header to row 1 and .main to row 3 so .main always lands in the
+ * 1fr track, even when <UpdateBanner/> returns null and the DOM only has
+ * two children (header + main). Without this, auto-placement put .main in
+ * row 2 (auto) and the 1fr row stayed empty, collapsing the panels to
+ * content height. */
+.app > header        { grid-row: 1; }
+.app > .update-banner { grid-row: 2; }
+.app > .main         { grid-row: 3; }
 
 /* ---- header ---- */
 header {
