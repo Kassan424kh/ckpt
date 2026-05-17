@@ -806,15 +806,28 @@ button.danger.solid:hover:not(:disabled) { background: var(--warn); border-color
   font-size: 18px;
   line-height: 1;
 }
+/* When the warn callout has inline elements (<strong>, <span class="icon">),
+ * wrap them in a child <span> so the whole text reads as a single flex item
+ * instead of one item per inline element. */
+.settings-help.warn > span {
+  flex: 1;
+  min-width: 0;
+}
+.settings-help.warn > span .icon {
+  vertical-align: -3px;
+  margin: 0 1px;
+}
 .settings-actions {
   display: flex;
   gap: 8px;
   flex-wrap: wrap;
 }
 .settings-actions button {
-  flex: 1;
-  padding: 8px 16px;
-  min-width: 110px;
+  flex: 1 1 auto;        /* size to content; share leftover space */
+  padding: 8px 14px;
+  min-width: 0;
+  white-space: nowrap;   /* keep labels on one line */
+  justify-content: center;
 }
 
 /* ---- scrollbars ---- */

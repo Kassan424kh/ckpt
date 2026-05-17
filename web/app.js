@@ -184,14 +184,14 @@ function SettingsModal({ settings, updateSettings, hasUndo, onClose, onPrune, on
       <div class="settings-section">
         <div class="settings-section-title">Maintenance · all projects</div>
         <p class="settings-help warn">
-          These actions fan out across <strong>every</strong> registered project.
-          Use the <span class="icon sm">more_vert</span> menu on each project row
-          for the same actions scoped to a single project.
+          <span>These actions fan out across <strong>every</strong> registered project.
+            Use the per-project <span class="icon sm">more_vert</span> menu to scope
+            the same actions to a single project.</span>
         </p>
         <div class="settings-actions">
           <button onClick=${onPrune}><span class="icon">filter_list</span>Prune all…</button>
           <button onClick=${onUndo} disabled=${!hasUndo} title="Roll back the last restore in every project"><span class="icon">undo</span>Undo all</button>
-          <button class="danger solid" onClick=${onClean}><span class="icon">delete_sweep</span>Clean every project</button>
+          <button class="danger solid" onClick=${onClean}><span class="icon">delete_sweep</span>Clean all</button>
         </div>
       </div>
     <//>
