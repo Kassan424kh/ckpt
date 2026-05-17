@@ -708,6 +708,14 @@ function App() {
     refreshCkpts(true);
   }, [selectedProject]);
 
+  // Auto-select the newest checkpoint when nothing is selected — on first
+  // load, after the selected one is deleted, after switching project, etc.
+  useEffect(() => {
+    if (!selectedCkpt && checkpoints.length > 0) {
+      selectCheckpoint(checkpoints[0].id);
+    }
+  }, [checkpoints, selectedCkpt, selectCheckpoint]);
+
   useEffect(() => {
     const t = setInterval(() => {
       if (!document.hidden) { refreshCkpts(false); refreshProjects(); }
