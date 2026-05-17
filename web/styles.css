@@ -829,6 +829,10 @@ button.danger.solid:hover:not(:disabled) { background: var(--warn); border-color
   white-space: nowrap;   /* keep labels on one line */
   justify-content: center;
 }
+/* warn callout placed below the buttons gets extra top margin */
+.settings-help.warn.settings-help-below {
+  margin-top: 16px;
+}
 
 /* ---- scrollbars ---- */
 ::-webkit-scrollbar { width: 9px; height: 9px; }
