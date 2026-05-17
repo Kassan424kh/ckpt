@@ -191,6 +191,11 @@ button.danger.solid:hover:not(:disabled) { background: var(--warn); border-color
   overflow: hidden;
   min-height: 0;
 }
+/* Same anchoring trick as .app: when .prompt-pane is `display: none`
+ * (no prompt selected), grid auto-placement would put .main-right-bottom
+ * into row 1 (auto) and collapse Files + Diff. Pin them by explicit row. */
+.main-right > .prompt-pane         { grid-row: 1; }
+.main-right > .main-right-bottom   { grid-row: 2; }
 .main-right-bottom {
   display: grid;
   grid-template-columns: 280px 1fr;
