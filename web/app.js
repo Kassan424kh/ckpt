@@ -182,11 +182,16 @@ function SettingsModal({ settings, updateSettings, hasUndo, onClose, onPrune, on
         </p>
       </div>
       <div class="settings-section">
-        <div class="settings-section-title">Maintenance</div>
+        <div class="settings-section-title">Maintenance · all projects</div>
+        <p class="settings-help warn">
+          These actions fan out across <strong>every</strong> registered project.
+          Use the <span class="icon sm">more_vert</span> menu on each project row
+          for the same actions scoped to a single project.
+        </p>
         <div class="settings-actions">
-          <button onClick=${onPrune}>Prune…</button>
-          <button onClick=${onUndo} disabled=${!hasUndo} title=${hasUndo ? 'Roll back the last restore' : 'No restore to undo'}><span class="icon">undo</span>Undo</button>
-          <button class="danger solid" onClick=${onClean}>Clean all</button>
+          <button onClick=${onPrune}><span class="icon">filter_list</span>Prune all…</button>
+          <button onClick=${onUndo} disabled=${!hasUndo} title="Roll back the last restore in every project"><span class="icon">undo</span>Undo all</button>
+          <button class="danger solid" onClick=${onClean}><span class="icon">delete_sweep</span>Clean every project</button>
         </div>
       </div>
     <//>
@@ -195,7 +200,34 @@ function SettingsModal({ settings, updateSettings, hasUndo, onClose, onPrune, on
 
 // ---------- projects column ----------
 
-function ProjectList({ projects, selectedId, onSelect }) {
+function ProjectMenu({ onClose, onPrune, onUndo, onClean }) {
+  useEffect(() => {
+    const onKey = (e) => { if (e.key === 'Escape') onClose(); };
+    const onDown = (e) => {
+      if (e.target.closest('.kebab-menu') || e.target.closest('.kebab')) return;
+      onClose();
+    };
+    document.addEventListener('keydown', onKey);
+    document.addEventListener('mousedown', onDown);
+    return () => {
+      document.removeEventListener('keydown', onKey);
+      document.removeEventListener('mousedown', onDown);
+    };
+  }, [onClose]);
+  return html`
+    <div class="kebab-menu" onClick=${(e) => e.stopPropagation()}>
+      <button class="kebab-menu-item" onClick=${onPrune}><span class="icon sm">filter_list</span>Prune…</button>
+      <button class="kebab-menu-item" onClick=${onUndo}><span class="icon sm">undo</span>Undo</button>
+      <button class="kebab-menu-item danger" onClick=${onClean}><span class="icon sm">delete_sweep</span>Clean all</button>
+    </div>
+  `;
+}
+
+function ProjectList({
+  projects, selectedId, openMenuId, onSelect,
+  onOpenMenu, onCloseMenu,
+  onPruneProject, onUndoProject, onCleanProject,
+}) {
   if (!projects.length) {
     return html`<div class="empty">no projects yet — run Claude in a git repo</div>`;
   }
@@ -206,8 +238,23 @@ function ProjectList({ projects, selectedId, onSelect }) {
              class=${classes('project', selectedId === p.id && 'selected', !p.exists && 'missing')}
              onClick=${() => p.exists && onSelect(p.id)}
              title=${p.exists ? p.path : 'directory missing'}>
+          ${p.exists ? html`
+            <button class="kebab"
+                    title="Project actions"
+                    onClick=${(e) => { e.stopPropagation(); onOpenMenu(openMenuId === p.id ? null : p.id); }}>
+              <span class="icon sm">more_vert</span>
+            </button>
+          ` : null}
           <div class="name">${p.name || p.path.split('/').pop()}</div>
           <div class="path">${p.path}</div>
+          ${openMenuId === p.id ? html`
+            <${ProjectMenu}
+              onClose=${() => onCloseMenu()}
+              onPrune=${() => { onCloseMenu(); onPruneProject(p); }}
+              onUndo=${() => { onCloseMenu(); onUndoProject(p); }}
+              onClean=${() => { onCloseMenu(); onCleanProject(p); }}
+            />
+          ` : null}
         </div>
       `)}
     </div>
@@ -517,6 +564,9 @@ function App() {
   // self-update
   const [updateInfo, setUpdateInfo] = useState(null);
   const [updateBusy, setUpdateBusy] = useState(false);
+
+  // project-row kebab menu (one open at a time)
+  const [openMenuId, setOpenMenuId] = useState(null);
   const updateSettings = useCallback((patch) => {
     setSettingsState(prev => { const s = { ...prev, ...patch }; saveSettings(s); return s; });
   }, []);
@@ -727,31 +777,80 @@ function App() {
     else toast(r?.error || 'restore failed', 'err');
   }, [selectedProject, selectedCkpt]);
 
-  const doUndo = useCallback(async () => {
+  const doUndo = useCallback(async (projectId) => {
     setModal(null);
-    const r = await api.post(`${apiBase(selectedProject)}/undo`);
+    const pid = projectId || selectedProject;
+    if (!pid) return;
+    const r = await api.post(`${apiBase(pid)}/undo`);
     if (r?.ok) { toast('reverted to pre-restore state', 'ok'); refreshCkpts(true); }
     else toast(r?.error || 'undo failed', 'err');
   }, [selectedProject, refreshCkpts]);
 
-  const doClean = useCallback(async () => {
+  const doClean = useCallback(async (projectId) => {
     setModal(null);
-    const r = await api.post(`${apiBase(selectedProject)}/clean`);
+    const pid = projectId || selectedProject;
+    if (!pid) return;
+    const r = await api.post(`${apiBase(pid)}/clean`);
     if (r?.ok) {
       toast(`deleted ${r.deleted} checkpoint(s)`, 'ok');
-      setSelectedCkpt(null); setFiles([]); setSelectedFile(null); setDiff(null); setPrompt(null);
+      if (pid === selectedProject) {
+        setSelectedCkpt(null); setFiles([]); setSelectedFile(null); setDiff(null); setPrompt(null);
+      }
       refreshCkpts(true);
     } else {
       toast(r?.error || 'clean failed', 'err');
     }
   }, [selectedProject, refreshCkpts]);
 
-  const doPrune = useCallback(async (n) => {
+  const doPrune = useCallback(async (n, projectId) => {
     setModal(null);
-    const r = await api.post(`${apiBase(selectedProject)}/prune`, { n });
+    const pid = projectId || selectedProject;
+    if (!pid) return;
+    const r = await api.post(`${apiBase(pid)}/prune`, { n });
     if (r?.ok) { toast(`pruned ${r.deleted}; kept newest ${n}`, 'ok'); refreshCkpts(true); }
     else toast(r?.error || 'prune failed', 'err');
   }, [selectedProject, refreshCkpts]);
+
+  // --- global variants: fan out across every existing project ---
+  const doGlobalPrune = useCallback(async (n) => {
+    setModal(null);
+    const visible = projects.filter(p => p.exists);
+    if (!visible.length) { toast('no projects', 'info'); return; }
+    toast(`pruning ${visible.length} project(s)…`, 'info');
+    const results = await Promise.all(
+      visible.map(p => api.post(`${apiBase(p.id)}/prune`, { n }).catch(() => ({ ok: false })))
+    );
+    const total = results.filter(r => r?.ok).reduce((s, r) => s + (r.deleted || 0), 0);
+    toast(`pruned ${total} across ${visible.length} project(s); kept newest ${n} each`, 'ok');
+    refreshCkpts(true); refreshProjects();
+  }, [projects, refreshCkpts, refreshProjects]);
+
+  const doGlobalClean = useCallback(async () => {
+    setModal(null);
+    const visible = projects.filter(p => p.exists);
+    if (!visible.length) { toast('no projects', 'info'); return; }
+    toast(`cleaning ${visible.length} project(s)…`, 'info');
+    const results = await Promise.all(
+      visible.map(p => api.post(`${apiBase(p.id)}/clean`).catch(() => ({ ok: false })))
+    );
+    const total = results.filter(r => r?.ok).reduce((s, r) => s + (r.deleted || 0), 0);
+    toast(`deleted ${total} across ${visible.length} project(s)`, 'ok');
+    setSelectedCkpt(null); setFiles([]); setSelectedFile(null); setDiff(null); setPrompt(null);
+    refreshCkpts(true);
+  }, [projects, refreshCkpts]);
+
+  const doGlobalUndo = useCallback(async () => {
+    setModal(null);
+    const visible = projects.filter(p => p.exists);
+    if (!visible.length) { toast('no projects', 'info'); return; }
+    toast(`undoing in ${visible.length} project(s)…`, 'info');
+    const results = await Promise.all(
+      visible.map(p => api.post(`${apiBase(p.id)}/undo`).catch(() => ({ ok: false })))
+    );
+    const ok = results.filter(r => r?.ok).length;
+    toast(ok ? `reverted in ${ok} project(s)` : 'no projects had a safety snapshot', ok ? 'ok' : 'info');
+    refreshCkpts(true);
+  }, [projects, refreshCkpts]);
 
   // ---------- modals ----------
 
@@ -837,6 +936,88 @@ function App() {
     `,
   });
 
+  // ---------- per-project openers (targeted by kebab menu) ----------
+
+  const openPruneProject = (project) => {
+    let val = 20;
+    setModal({
+      title: html`Prune <code>${project.name}</code>`,
+      body: html`
+        <p>Keep only the N most recent checkpoints in this project.</p>
+        <p>Keep: <input type="number" min="0" value=${val} onInput=${(e) => val = parseInt(e.currentTarget.value, 10)}/></p>
+      `,
+      actions: html`
+        <button onClick=${() => setModal(null)}>Cancel</button>
+        <button class="primary" onClick=${() => doPrune(val, project.id)}>Prune</button>
+      `,
+    });
+  };
+
+  const openUndoProject = (project) => setModal({
+    title: html`Undo last restore in <code>${project.name}</code>`,
+    body: html`
+      <p>Hard-reset working tree and index of this project to its pre-restore safety snapshot.</p>
+      <p class="muted">Any changes after the restore will be lost. Does nothing if no recent restore exists.</p>
+    `,
+    actions: html`
+      <button onClick=${() => setModal(null)}>Cancel</button>
+      <button class="primary" onClick=${() => doUndo(project.id)}>Undo</button>
+    `,
+  });
+
+  const openCleanProject = (project) => setModal({
+    title: html`Delete all checkpoints in <code>${project.name}</code>?`,
+    body: html`
+      <p>Removes every checkpoint plus the undo safety snapshot for this project.</p>
+      <p class="muted">Working tree unchanged. Not reversible.</p>
+    `,
+    actions: html`
+      <button onClick=${() => setModal(null)}>Cancel</button>
+      <button class="danger solid" onClick=${() => doClean(project.id)}>Delete all</button>
+    `,
+  });
+
+  // ---------- global openers (used by the Settings modal) ----------
+
+  const openGlobalPrune = () => {
+    let val = 20;
+    setModal({
+      title: 'Prune all projects',
+      body: html`
+        <p>Keep only the N most recent checkpoints in <strong>every</strong> registered project.</p>
+        <p>Keep: <input type="number" min="0" value=${val} onInput=${(e) => val = parseInt(e.currentTarget.value, 10)}/></p>
+      `,
+      actions: html`
+        <button onClick=${() => setModal(null)}>Cancel</button>
+        <button class="primary" onClick=${() => doGlobalPrune(val)}>Prune all projects</button>
+      `,
+    });
+  };
+
+  const openGlobalUndo = () => setModal({
+    title: 'Undo last restore in all projects',
+    body: html`
+      <p>Hard-reset every project to its pre-restore safety snapshot.</p>
+      <p class="muted">Projects without a recent restore are skipped. Any changes after each restore will be lost.</p>
+    `,
+    actions: html`
+      <button onClick=${() => setModal(null)}>Cancel</button>
+      <button class="primary" onClick=${() => doGlobalUndo()}>Undo everywhere</button>
+    `,
+  });
+
+  const openGlobalClean = () => setModal({
+    title: 'Delete all checkpoints in every project?',
+    body: html`
+      <p>Removes <strong>every</strong> checkpoint plus undo snapshots from <strong>every</strong> registered project.</p>
+      <p class="muted">Working trees are unchanged. Not reversible.</p>
+    `,
+    actions: html`
+      <button onClick=${() => setModal(null)}>Cancel</button>
+      <button class="danger solid" onClick=${() => doGlobalClean()}>Delete all everywhere</button>
+    `,
+  });
+
   // ---------- render ----------
 
   const selCkpt = checkpoints.find(c => c.id === selectedCkpt);
@@ -859,7 +1040,17 @@ function App() {
         <div class="col">
           <div class="col-header">Projects <span class="count">(${projects.filter(p => p.exists).length})</span></div>
           <div class="col-body">
-            <${ProjectList} projects=${projects} selectedId=${selectedProject} onSelect=${setSelectedProject}/>
+            <${ProjectList}
+              projects=${projects}
+              selectedId=${selectedProject}
+              openMenuId=${openMenuId}
+              onSelect=${setSelectedProject}
+              onOpenMenu=${setOpenMenuId}
+              onCloseMenu=${() => setOpenMenuId(null)}
+              onPruneProject=${openPruneProject}
+              onUndoProject=${openUndoProject}
+              onCleanProject=${openCleanProject}
+            />
           </div>
         </div>
         <div class="col">
@@ -896,11 +1087,11 @@ function App() {
         <${SettingsModal}
           settings=${settings}
           updateSettings=${updateSettings}
-          hasUndo=${status.has_undo}
+          hasUndo=${true}
           onClose=${() => setShowSettings(false)}
-          onPrune=${() => { setShowSettings(false); openPrune(); }}
-          onUndo=${() => { setShowSettings(false); openUndo(); }}
-          onClean=${() => { setShowSettings(false); openClean(); }}
+          onPrune=${() => { setShowSettings(false); openGlobalPrune(); }}
+          onUndo=${() => { setShowSettings(false); openGlobalUndo(); }}
+          onClean=${() => { setShowSettings(false); openGlobalClean(); }}
         />
       `}
     </div>
