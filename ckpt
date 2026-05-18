@@ -6,6 +6,7 @@ Modes:
     ckpt --hook save-prompt        UserPromptSubmit hook
     ckpt --hook checkpoint         Stop hook
     ckpt ui                        Launch web UI
+    ckpt mcp                       Run as a stdio MCP server (JSON-RPC over stdio)
     ckpt list                      List current project's checkpoints
     ckpt show <ref>                Diff of a checkpoint
     ckpt restore [<ref> [path]]    Interactive picker, or full / single-file restore
@@ -1345,6 +1346,354 @@ def cmd_ui(args):
         _running_ui_port = None
 
 
+# ---------------- MCP server (stdio JSON-RPC 2.0) ----------------
+#
+# `ckpt mcp` runs an MCP server over stdin/stdout so any MCP-compatible
+# agent (Claude Code, Claude Desktop, etc.) can list projects, browse
+# checkpoints, fetch diffs/prompts/file contents, and trigger restores.
+#
+# Wire format: newline-delimited JSON-RPC 2.0 (per the MCP stdio transport
+# spec). Logs go to stderr; stdout is reserved for protocol messages.
+
+MCP_PROTOCOL_VERSION = "2024-11-05"
+
+MCP_TOOLS = [
+    {
+        "name": "list_projects",
+        "description": (
+            "List every project ckpt knows about on this machine. Returns id "
+            "(short 8-char), name, absolute path, registered_at/last_seen "
+            "epoch seconds, and whether the path still exists."
+        ),
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "get_project_status",
+        "description": (
+            "Status snapshot for a project: current branch, total checkpoint "
+            "count, and whether an undo snapshot (pre-restore safety) exists."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project_id": {"type": "string", "description": "8-char id from list_projects"},
+            },
+            "required": ["project_id"],
+        },
+    },
+    {
+        "name": "list_checkpoints",
+        "description": (
+            "List checkpoints for a project, newest first. Each row has id "
+            "(timestamp like 20260517-112209), ref, relative + iso time, "
+            "commit subject, and aggregate stats (files/insertions/deletions)."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project_id": {"type": "string"},
+                "limit": {"type": "integer", "minimum": 1, "description": "Optional cap on rows returned"},
+            },
+            "required": ["project_id"],
+        },
+    },
+    {
+        "name": "get_checkpoint_prompt",
+        "description": "Return the full user prompt that produced a checkpoint (may be null).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project_id": {"type": "string"},
+                "checkpoint_id": {"type": "string", "description": "Timestamp id, or 'latest'/'last'/'-N'"},
+            },
+            "required": ["project_id", "checkpoint_id"],
+        },
+    },
+    {
+        "name": "get_checkpoint_files",
+        "description": "List files changed by a checkpoint vs its parent. Each row is {status, path}.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project_id": {"type": "string"},
+                "checkpoint_id": {"type": "string"},
+            },
+            "required": ["project_id", "checkpoint_id"],
+        },
+    },
+    {
+        "name": "get_checkpoint_diff",
+        "description": (
+            "Unified diff of a checkpoint against its parent. If `path` is "
+            "given, only that file's diff is returned."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project_id": {"type": "string"},
+                "checkpoint_id": {"type": "string"},
+                "path": {"type": "string", "description": "Optional file path to limit the diff to"},
+            },
+            "required": ["project_id", "checkpoint_id"],
+        },
+    },
+    {
+        "name": "get_file_at_checkpoint",
+        "description": "Full contents of a file as it was at a checkpoint.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project_id": {"type": "string"},
+                "checkpoint_id": {"type": "string"},
+                "path": {"type": "string"},
+            },
+            "required": ["project_id", "checkpoint_id", "path"],
+        },
+    },
+    {
+        "name": "restore_checkpoint",
+        "description": (
+            "MUTATES the working tree. Restores the project to a checkpoint. "
+            "An undo snapshot is recorded automatically. Pass `path` to "
+            "restore a single file. Pass `delete_later: true` to also drop "
+            "every checkpoint newer than this one."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project_id": {"type": "string"},
+                "checkpoint_id": {"type": "string"},
+                "path": {"type": "string", "description": "Optional — restore only this single file"},
+                "delete_later": {"type": "boolean", "default": False},
+            },
+            "required": ["project_id", "checkpoint_id"],
+        },
+    },
+    {
+        "name": "undo_restore",
+        "description": "MUTATES the working tree. Roll back the most recent restore in a project.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"project_id": {"type": "string"}},
+            "required": ["project_id"],
+        },
+    },
+    {
+        "name": "delete_checkpoint",
+        "description": "Delete a single checkpoint ref (and its db row).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project_id": {"type": "string"},
+                "checkpoint_id": {"type": "string"},
+            },
+            "required": ["project_id", "checkpoint_id"],
+        },
+    },
+    {
+        "name": "prune_checkpoints",
+        "description": "Keep only the N newest checkpoints in a project; delete the rest.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project_id": {"type": "string"},
+                "keep": {"type": "integer", "minimum": 0},
+            },
+            "required": ["project_id", "keep"],
+        },
+    },
+]
+
+
+def _mcp_project_root(project_id):
+    """Resolve a project_id to an existing on-disk path, or raise."""
+    if not project_id:
+        raise ValueError("project_id is required")
+    p = get_project(project_id)
+    if not p:
+        raise ValueError(f"project not found: {project_id}")
+    path = p["path"]
+    if not os.path.isdir(path):
+        raise ValueError(f"project path no longer exists: {path}")
+    return path
+
+
+def _mcp_resolve_ref(root, checkpoint_id):
+    """Accept timestamp ids, 'latest'/'last'/'-N', partial substrings, or full refs."""
+    if not checkpoint_id:
+        raise ValueError("checkpoint_id is required")
+    ref = _resolve_ref(root, checkpoint_id)
+    if not ref:
+        raise ValueError(f"checkpoint not found: {checkpoint_id}")
+    return ref
+
+
+def mcp_dispatch_tool(name, args):
+    """Run a single MCP tool. Returns a plain dict (encoded by the caller).
+    Raises ValueError on bad input, RuntimeError on tool failure."""
+    args = args or {}
+
+    if name == "list_projects":
+        return {"projects": list_projects()}
+
+    if name not in {t["name"] for t in MCP_TOOLS}:
+        raise ValueError(f"unknown tool: {name}")
+
+    root = _mcp_project_root(args.get("project_id"))
+
+    if name == "get_project_status":
+        return status_for(root)
+
+    if name == "list_checkpoints":
+        rows = list_checkpoints(root)
+        limit = args.get("limit")
+        if isinstance(limit, int) and limit > 0:
+            rows = rows[:limit]
+        return {"checkpoints": rows}
+
+    ref = _mcp_resolve_ref(root, args.get("checkpoint_id"))
+    ckpt_id = ref.rsplit("/", 1)[-1]
+
+    if name == "get_checkpoint_prompt":
+        return {"checkpoint_id": ckpt_id, "prompt": get_prompt_for(root, ckpt_id)}
+
+    if name == "get_checkpoint_files":
+        return {"checkpoint_id": ckpt_id, "files": get_files_for(root, ref)}
+
+    if name == "get_checkpoint_diff":
+        path = args.get("path")
+        if path:
+            return {"checkpoint_id": ckpt_id, "path": path,
+                    "diff": get_file_diff(root, ref, path)}
+        out, _, _ = git("diff", f"{ref}^", ref, cwd=root)
+        return {"checkpoint_id": ckpt_id, "diff": out}
+
+    if name == "get_file_at_checkpoint":
+        path = args.get("path")
+        if not path:
+            raise ValueError("path is required")
+        out, err, code = git("show", f"{ref}:{path}", cwd=root)
+        if code != 0:
+            raise RuntimeError((err or "git show failed").strip())
+        return {"checkpoint_id": ckpt_id, "path": path, "content": out}
+
+    if name == "restore_checkpoint":
+        path = args.get("path")
+        if path:
+            return op_restore_file(root, ref, path)
+        return op_restore_full(root, ref, bool(args.get("delete_later", False)))
+
+    if name == "undo_restore":
+        return op_undo(root)
+
+    if name == "delete_checkpoint":
+        return op_delete(root, ref)
+
+    if name == "prune_checkpoints":
+        keep = args.get("keep")
+        if not isinstance(keep, int) or keep < 0:
+            raise ValueError("keep must be a non-negative integer")
+        return op_prune(root, keep)
+
+    raise ValueError(f"unknown tool: {name}")
+
+
+def _mcp_log(msg):
+    """Server-side logging — goes to stderr so it doesn't corrupt the protocol stream."""
+    try:
+        print(f"[ckpt mcp] {msg}", file=sys.stderr, flush=True)
+    except Exception:
+        pass
+
+
+def mcp_serve():
+    """Run the stdio MCP loop. Reads one JSON-RPC message per line of stdin,
+    writes one JSON-RPC message per line of stdout."""
+    server_info = {"name": "ckpt", "version": installed_version() or "dev"}
+
+    def send(obj):
+        sys.stdout.write(json.dumps(obj, ensure_ascii=False) + "\n")
+        sys.stdout.flush()
+
+    def respond(req_id, result):
+        send({"jsonrpc": "2.0", "id": req_id, "result": result})
+
+    def err(req_id, code, message, data=None):
+        e = {"code": code, "message": message}
+        if data is not None:
+            e["data"] = data
+        send({"jsonrpc": "2.0", "id": req_id, "error": e})
+
+    for raw in sys.stdin:
+        line = raw.strip()
+        if not line:
+            continue
+        try:
+            msg = json.loads(line)
+        except Exception as e:
+            _mcp_log(f"parse error: {e}")
+            continue
+        if not isinstance(msg, dict):
+            continue
+
+        method = msg.get("method") or ""
+        params = msg.get("params") or {}
+        req_id = msg.get("id")
+        is_notification = req_id is None
+
+        if method == "initialize":
+            client_v = (params.get("protocolVersion") or "").strip()
+            respond(req_id, {
+                "protocolVersion": client_v or MCP_PROTOCOL_VERSION,
+                "capabilities": {"tools": {"listChanged": False}},
+                "serverInfo": server_info,
+            })
+            continue
+
+        if method in ("notifications/initialized", "notifications/cancelled"):
+            continue  # notifications: no response
+
+        if method == "ping":
+            if not is_notification:
+                respond(req_id, {})
+            continue
+
+        if method == "tools/list":
+            respond(req_id, {"tools": MCP_TOOLS})
+            continue
+
+        if method == "tools/call":
+            name = params.get("name") or ""
+            args = params.get("arguments") or {}
+            try:
+                result = mcp_dispatch_tool(name, args)
+                respond(req_id, {
+                    "content": [{"type": "text", "text": json.dumps(result, indent=2, ensure_ascii=False)}],
+                    "isError": False,
+                })
+            except Exception as e:
+                respond(req_id, {
+                    "content": [{"type": "text", "text": f"{type(e).__name__}: {e}"}],
+                    "isError": True,
+                })
+            continue
+
+        if method == "shutdown":
+            if not is_notification:
+                respond(req_id, {})
+            return
+
+        if not is_notification:
+            err(req_id, -32601, f"Method not found: {method}")
+
+
+def cmd_mcp(_args):
+    try:
+        mcp_serve()
+    except (KeyboardInterrupt, BrokenPipeError):
+        pass
+
+
 # ---------------- main dispatch ----------------
 
 def main():
@@ -1378,6 +1727,8 @@ def main():
     p.add_argument("--port", type=int, default=None)
     p.add_argument("--no-open", action="store_true")
     p.set_defaults(func=cmd_ui)
+
+    sub.add_parser("mcp", help="Run as a stdio MCP server").set_defaults(func=cmd_mcp)
 
     sub.add_parser("projects", help="List known projects").set_defaults(func=lambda a: cmd_projects())
     sub.add_parser("migrate",  help="Migrate old in-repo .claude/ setup to ckpt").set_defaults(func=lambda a: cmd_migrate())

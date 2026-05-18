@@ -92,6 +92,46 @@ A local web server on `127.0.0.1` (no remote exposure) shows:
 
 Built with Preact + htm — no build step, single-file React-style components.
 
+## MCP server
+
+`ckpt` ships with a built-in [Model Context Protocol](https://modelcontextprotocol.io) server so any MCP-compatible agent — Claude Code, Claude Desktop, custom SDK agents — can connect over stdio and browse every checkpoint on this machine, across every project.
+
+Configure it once:
+
+```jsonc
+// ~/.claude.json (Claude Code) or your MCP client's config
+{
+  "mcpServers": {
+    "ckpt": {
+      "command": "ckpt",
+      "args": ["mcp"]
+    }
+  }
+}
+```
+
+Then the agent can call these tools:
+
+| Tool | Reads / writes | What it does |
+| --- | --- | --- |
+| `list_projects` | read | Every project ckpt has seen — id, name, path, last_seen |
+| `get_project_status` | read | Branch, total checkpoint count, whether an undo snapshot exists |
+| `list_checkpoints` | read | Newest-first list of checkpoints for a project, with `+N -M · F files` stats |
+| `get_checkpoint_prompt` | read | The full user prompt that produced a checkpoint |
+| `get_checkpoint_files` | read | Files changed by a checkpoint (`status`, `path`) |
+| `get_checkpoint_diff` | read | Unified diff of a checkpoint vs its parent — whole-checkpoint or per-file |
+| `get_file_at_checkpoint` | read | Full contents of a file as it was at a checkpoint |
+| `restore_checkpoint` | **write** | Restore the working tree (or a single file). Always records an undo snapshot |
+| `undo_restore` | **write** | Roll back the most recent restore |
+| `delete_checkpoint` | **write** | Delete one checkpoint |
+| `prune_checkpoints` | **write** | Keep only the N newest |
+
+The `checkpoint_id` accepts the same forms as the CLI: a timestamp like `20260517-112209`, `latest` / `last` / `-1`, `-N` for the Nth-newest, or any unique substring.
+
+Write tools mutate the user's working tree — the MCP client (Claude Code, etc.) mediates user consent before each tool call.
+
+Transport is line-delimited JSON-RPC 2.0 over stdin/stdout; protocol logs (if any) go to stderr so the protocol stream stays clean. No extra dependencies.
+
 ## CLI commands
 
 ```
