@@ -264,6 +264,28 @@ def _restore_db(root, backup_path):
         try: db_path.unlink()
         except Exception: pass
 
+
+def _remove_untracked_after_restore(root):
+    """Delete non-ignored untracked files left over after a read-tree restore.
+
+    `git read-tree --reset -u` only touches files in the index, so any file
+    added to the working tree after the target checkpoint (and thus never
+    indexed) survives the restore. Snapshots, by contrast, capture untracked
+    files via `git add -A`, so users expect a restore to mirror the snapshot
+    exactly — including the absence of files added later. The project DB
+    files are preserved unconditionally.
+    """
+    out, _, _ = git("ls-files", "--others", "--exclude-standard", cwd=root)
+    keep = set(_DB_EXCLUDE_PATHS)
+    for rel in out.splitlines():
+        if not rel or rel in keep:
+            continue
+        try:
+            os.unlink(os.path.join(root, rel))
+        except (FileNotFoundError, IsADirectoryError, PermissionError):
+            pass
+
+
 def make_snapshot_commit(root, message):
     """Snapshot working tree (incl. untracked, respecting .gitignore) into a
     parentless-or-from-HEAD commit. Live index/worktree untouched.
@@ -438,6 +460,7 @@ def op_restore_full(root, ref, delete_later=False):
         _restore_db(root, db_backup)
         return {"ok": False, "error": (err or "read-tree failed").strip()}
     _restore_db(root, db_backup)
+    _remove_untracked_after_restore(root)
 
     deleted = 0
     if delete_later:
@@ -517,6 +540,7 @@ def op_undo(root):
         _restore_db(root, db_backup)
         return {"ok": False, "error": err.strip() or "read-tree failed"}
     _restore_db(root, db_backup)
+    _remove_untracked_after_restore(root)
     return {"ok": True}
 
 
