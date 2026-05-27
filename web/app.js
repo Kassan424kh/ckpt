@@ -4,7 +4,7 @@
 // Preact instance — otherwise `useState` fails with `undefined.__H`.
 import {
   html, render,
-  useState, useEffect, useCallback, useRef,
+  useState, useEffect, useCallback, useRef, useMemo,
 } from 'https://esm.sh/htm@3.1.1/preact/standalone';
 import hljs from 'https://esm.sh/highlight.js@11.9.0';
 
@@ -72,6 +72,42 @@ const apiBase = (pid) => `/api/projects/${encodeURIComponent(pid)}`;
 
 function classes(...xs) { return xs.filter(Boolean).join(' '); }
 
+// Wrap each match of `query` in `text` with a <mark> so the column rows can
+// show *what* matched, not just that something did. Returns the text unchanged
+// when the query is empty or the regex is invalid — callers can drop it in
+// place of plain text without guarding.
+function highlightText(text, query, regex) {
+  if (!query || text == null) return text;
+  const str = String(text);
+  let re;
+  try {
+    re = regex
+      ? new RegExp(query, 'g')
+      : new RegExp(query.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'gi');
+  } catch {
+    return str;
+  }
+  const parts = [];
+  let last = 0, m;
+  while ((m = re.exec(str)) !== null) {
+    if (m.index > last) parts.push(str.slice(last, m.index));
+    parts.push(html`<mark>${m[0]}</mark>`);
+    last = m.index + m[0].length;
+    if (m[0].length === 0) re.lastIndex++;   // guard against zero-width regex
+  }
+  if (!parts.length) return str;
+  if (last < str.length) parts.push(str.slice(last));
+  return parts;
+}
+
+// Curry a per-render highlighter so we don't thread `query`/`regex` through
+// every child. When there's no active query, returns identity so React skips
+// the work entirely.
+function makeHighlighter(query, regex) {
+  if (!query?.trim()) return (text) => text;
+  return (text) => highlightText(text, query, regex);
+}
+
 // ---------- toasts (module-level for simplicity) ----------
 
 let _toastSink = null;
@@ -118,17 +154,172 @@ function Modal({ title, body, children, actions, onClose }) {
 
 // ---------- header ----------
 
-function Header({ branch, live, onRefresh, onSettings }) {
+function Header({ branch, live, search, onRefresh, onSettings }) {
   return html`
     <header>
       <span class="glyph"><span class="icon lg">auto_awesome</span></span>
       <span class="title">ckpt</span>
       <span class="branch">${branch ? `${branch}` : ''}</span>
       <span class="spacer"></span>
+      ${search}
       <span class=${classes('live', live)}>${live === 'active' ? 'live' : live === 'offline' ? 'offline' : 'idle'}</span>
       <button onClick=${onRefresh} title="Refresh now"><span class="icon">refresh</span>Refresh</button>
       <button onClick=${onSettings} title="Settings (prune / undo / clean live here)"><span class="icon">settings</span>Settings</button>
     </header>
+  `;
+}
+
+// ---------- global search ----------
+
+const DEFAULT_SEARCH_OPTIONS = {
+  scope: { projects: true, checkpoints: true, diffs: true },
+  project_ids: [],   // empty = all visible projects
+  since: '',
+  until: '',
+  mode: 'include',   // include | exclude
+};
+
+function SearchFilters({ options, updateOptions, projects, onReset }) {
+  const scope = options.scope || {};
+  const setScope = (key, val) => updateOptions({ scope: { ...scope, [key]: val } });
+  const toggleProject = (pid) => {
+    const cur = new Set(options.project_ids || []);
+    if (cur.has(pid)) cur.delete(pid); else cur.add(pid);
+    updateOptions({ project_ids: [...cur] });
+  };
+  const visible = projects.filter(p => p.exists);
+  const allSelected = !(options.project_ids || []).length;
+  return html`
+    <div class="search-filters">
+      <div class="search-filter-row">
+        <div class="search-filter-label">Scope</div>
+        <div class="search-filter-controls">
+          ${[['projects', 'Projects'], ['checkpoints', 'Checkpoints'], ['diffs', 'Diffs']].map(([k, label]) => html`
+            <label key=${k} class="search-chip">
+              <input type="checkbox" checked=${scope[k] !== false}
+                     onChange=${(e) => setScope(k, e.currentTarget.checked)}/>
+              <span>${label}</span>
+            </label>
+          `)}
+        </div>
+      </div>
+      <div class="search-filter-row">
+        <div class="search-filter-label">Match</div>
+        <div class="search-filter-controls">
+          <label class="search-chip">
+            <input type="radio" name="search-mode" checked=${options.mode !== 'exclude'}
+                   onChange=${() => updateOptions({ mode: 'include' })}/>
+            <span>Includes</span>
+          </label>
+          <label class="search-chip">
+            <input type="radio" name="search-mode" checked=${options.mode === 'exclude'}
+                   onChange=${() => updateOptions({ mode: 'exclude' })}/>
+            <span>Excludes</span>
+          </label>
+        </div>
+      </div>
+      <div class="search-filter-row">
+        <div class="search-filter-label">Duration</div>
+        <div class="search-filter-controls">
+          <input type="date" class="search-date" value=${options.since}
+                 onInput=${(e) => updateOptions({ since: e.currentTarget.value })}/>
+          <span class="search-filter-dash">→</span>
+          <input type="date" class="search-date" value=${options.until}
+                 onInput=${(e) => updateOptions({ until: e.currentTarget.value })}/>
+          ${(options.since || options.until) ? html`
+            <button class="search-link"
+                    onClick=${() => updateOptions({ since: '', until: '' })}>any time</button>
+          ` : null}
+        </div>
+      </div>
+      <div class="search-filter-row">
+        <div class="search-filter-label">Projects</div>
+        <div class="search-filter-controls projects">
+          <label class="search-chip">
+            <input type="checkbox" checked=${allSelected}
+                   onChange=${() => updateOptions({ project_ids: [] })}/>
+            <span>All (${visible.length})</span>
+          </label>
+          ${visible.map(p => {
+            const checked = !allSelected && (options.project_ids || []).includes(p.id);
+            return html`
+              <label key=${p.id} class="search-chip" title=${p.path}>
+                <input type="checkbox" checked=${checked}
+                       onChange=${() => toggleProject(p.id)}/>
+                <span>${p.name || p.path.split('/').pop()}</span>
+              </label>
+            `;
+          })}
+        </div>
+      </div>
+      <div class="search-filter-footer">
+        <button class="search-link" onClick=${onReset}>Reset filters</button>
+      </div>
+    </div>
+  `;
+}
+
+function SearchBar({
+  inputRef, query, setQuery, regex, setRegex, options, updateOptions,
+  projects, showFilters, setShowFilters, busy, error, matchCount, onReset,
+}) {
+  const filterCount = (() => {
+    let n = 0;
+    if ((options.project_ids || []).length) n++;
+    if (options.since || options.until) n++;
+    if (options.mode === 'exclude') n++;
+    const s = options.scope || {};
+    if (s.projects === false || s.checkpoints === false || s.diffs === false) n++;
+    return n;
+  })();
+
+  const onKey = (e) => {
+    if (e.key === 'Escape') { setQuery(''); setShowFilters(false); e.currentTarget.blur(); }
+  };
+
+  const hasQuery = !!query.trim();
+  const meta = error ? html`<span class="search-meta err">${error}</span>`
+             : busy ? html`<span class="search-meta">searching…</span>`
+             : (hasQuery && matchCount != null)
+               ? html`<span class=${classes('search-meta', matchCount === 0 && 'zero')}>${matchCount}</span>`
+               : null;
+
+  return html`
+    <div class="search">
+      <div class=${classes('search-input-wrap', hasQuery && 'active')}>
+        <span class="icon search-leading">search</span>
+        <input ref=${inputRef}
+               type="text"
+               class="search-input"
+               placeholder="Filter projects, checkpoints, diffs…"
+               value=${query}
+               onInput=${(e) => setQuery(e.currentTarget.value)}
+               onKeyDown=${onKey}/>
+        ${meta}
+        <button class=${classes('search-toggle', regex && 'on')}
+                title="Treat query as a regular expression"
+                onClick=${() => setRegex(!regex)}>.*</button>
+        <button class=${classes('search-toggle', showFilters && 'on')}
+                title="Filters"
+                onClick=${() => setShowFilters(!showFilters)}>
+          <span class="icon sm">tune</span>
+          ${filterCount ? html`<span class="search-filter-badge">${filterCount}</span>` : null}
+        </button>
+        ${hasQuery ? html`
+          <button class="search-toggle clear"
+                  title="Clear"
+                  onClick=${() => setQuery('')}>
+            <span class="icon sm">close</span>
+          </button>
+        ` : null}
+      </div>
+      ${showFilters ? html`
+        <div class="search-filter-popup">
+          <${SearchFilters} options=${options} updateOptions=${updateOptions}
+                            projects=${projects} onReset=${onReset}/>
+        </div>
+      ` : null}
+    </div>
   `;
 }
 
@@ -227,6 +418,7 @@ function ProjectList({
   projects, selectedId, openMenuId, onSelect,
   onOpenMenu, onCloseMenu,
   onPruneProject, onUndoProject, onCleanProject,
+  highlight = (t) => t,
 }) {
   if (!projects.length) {
     return html`<div class="empty">no projects yet — run Claude in a git repo</div>`;
@@ -245,8 +437,8 @@ function ProjectList({
               <span class="icon sm">more_vert</span>
             </button>
           ` : null}
-          <div class="name"><span class="list-index">#${i + 1}</span>${p.name || p.path.split('/').pop()}</div>
-          <div class="path">${p.path}</div>
+          <div class="name"><span class="list-index">#${i + 1}</span>${highlight(p.name || p.path.split('/').pop())}</div>
+          <div class="path">${highlight(p.path)}</div>
           ${openMenuId === p.id ? html`
             <${ProjectMenu}
               onClose=${() => onCloseMenu()}
@@ -279,7 +471,7 @@ function StatsRow({ stats }) {
   return html`<div class="stats">${withSeps}</div>`;
 }
 
-function CheckpointRow({ ckpt, index, total, selected, isNew, onSelect, onRestore, onDelete, onPruneHere }) {
+function CheckpointRow({ ckpt, index, total, selected, isNew, onSelect, onRestore, onDelete, onPruneHere, highlight = (t) => t }) {
   // The last visible row is the oldest; pruning there would keep everything → disable.
   const isOldest = index === total;
   return html`
@@ -290,7 +482,7 @@ function CheckpointRow({ ckpt, index, total, selected, isNew, onSelect, onRestor
         <span class="when">${ckpt.when}</span>
         <span class="id">${ckpt.id}</span>
       </div>
-      <div class="msg">${ckpt.message}</div>
+      <div class="msg">${highlight(ckpt.message)}</div>
       <${StatsRow} stats=${ckpt.stats} />
       <div class="actions">
         <button class="prune-here"
@@ -307,7 +499,7 @@ function CheckpointRow({ ckpt, index, total, selected, isNew, onSelect, onRestor
   `;
 }
 
-function CheckpointList({ checkpoints, selectedId, newIds, onSelect, onRestore, onDelete, onPruneHere }) {
+function CheckpointList({ checkpoints, selectedId, newIds, onSelect, onRestore, onDelete, onPruneHere, highlight }) {
   if (!checkpoints.length) {
     return html`<div class="empty">no checkpoints yet — the Stop hook creates one after each turn</div>`;
   }
@@ -325,6 +517,7 @@ function CheckpointList({ checkpoints, selectedId, newIds, onSelect, onRestore, 
           onRestore=${() => onRestore(c)}
           onDelete=${() => onDelete(c)}
           onPruneHere=${() => onPruneHere(c, i + 1)}
+          highlight=${highlight}
         />
       `)}
     </div>
@@ -333,7 +526,7 @@ function CheckpointList({ checkpoints, selectedId, newIds, onSelect, onRestore, 
 
 // ---------- prompt pane ----------
 
-function PromptPane({ prompt, ckpt }) {
+function PromptPane({ prompt, ckpt, highlight = (t) => t }) {
   const copy = useCallback(() => {
     if (!prompt) return;
     const ok = () => toast('prompt copied', 'ok');
@@ -358,14 +551,14 @@ function PromptPane({ prompt, ckpt }) {
         <span class="prompt-spacer"></span>
         <button class="prompt-copy" onClick=${copy} title="Copy full prompt">Copy</button>
       </div>
-      <div class="prompt-text">${prompt}</div>
+      <div class="prompt-text">${highlight(prompt)}</div>
     </div>
   `;
 }
 
 // ---------- files column ----------
 
-function FilesList({ files, selectedFile, ckptId, ckpt, onSelect, onRestoreFile }) {
+function FilesList({ files, totalFiles, filtering, selectedFile, ckptId, ckpt, onSelect, onRestoreFile, highlight = (t) => t }) {
   const stats = ckpt?.stats;
   const headerStats = stats && (stats.insertions || stats.deletions) ? html`
     <span class="header-stats">
@@ -374,18 +567,25 @@ function FilesList({ files, selectedFile, ckptId, ckpt, onSelect, onRestoreFile 
     </span>
   ` : null;
 
+  const total = totalFiles != null ? totalFiles : files.length;
+  const countNode = filtering
+    ? html`<span class="count">(${files.length} / ${total})</span>`
+    : (total ? html`<span class="count">(${total})</span>` : null);
+
   return html`
     <div class="col">
       <div class="col-header">
-        <span>Files ${files.length ? html`<span class="count">(${files.length})</span>` : null}</span>
+        <span>Files ${countNode}</span>
         ${headerStats}
       </div>
       <div class="col-body">
         ${!ckptId
           ? html`<div class="empty">select a checkpoint</div>`
-          : !files.length
+          : !total
             ? html`<div class="empty">no files changed in this checkpoint</div>`
-            : files.map((f, i) => {
+            : !files.length
+              ? html`<div class="empty">no files match the filter</div>`
+              : files.map((f, i) => {
                 const s = (f.status || '?')[0];
                 return html`
                   <div key=${f.path}
@@ -393,7 +593,7 @@ function FilesList({ files, selectedFile, ckptId, ckpt, onSelect, onRestoreFile 
                        onClick=${() => onSelect(f.path)}>
                     <span class="list-index">#${i + 1}</span>
                     <span class=${`status ${s}`}>${s}</span>
-                    <span class="path" title=${f.path}>${f.path}</span>
+                    <span class="path" title=${f.path}>${highlight(f.path)}</span>
                     <button class="action"
                             title="Restore just this file"
                             onClick=${(e) => { e.stopPropagation(); onRestoreFile(f.path); }}><span class="icon sm">restore</span></button>
@@ -587,6 +787,29 @@ function App() {
 
   const lastIdsRef = useRef(new Set());
 
+  // ---------- global search ----------
+  const [searchQuery, setSearchQuery] = useState('');
+  const [searchRegex, setSearchRegex] = useState(false);
+  const [searchOptions, setSearchOptions] = useState(DEFAULT_SEARCH_OPTIONS);
+  const [showSearchFilters, setShowSearchFilters] = useState(false);
+  const [searchResults, setSearchResults] = useState(null);
+  const [searchBusy, setSearchBusy] = useState(false);
+  const [searchError, setSearchError] = useState(null);
+  const searchInputRef = useRef(null);
+  const searchSeqRef = useRef(0);
+
+  const updateSearchOptions = useCallback((patch) => {
+    setSearchOptions(prev => {
+      const next = { ...prev, ...patch };
+      if (patch.scope) next.scope = { ...(prev.scope || {}), ...patch.scope };
+      return next;
+    });
+  }, []);
+
+  const resetSearchOptions = useCallback(() => {
+    setSearchOptions(DEFAULT_SEARCH_OPTIONS);
+  }, []);
+
   // ---------- fetchers ----------
 
   const refreshProjects = useCallback(async () => {
@@ -744,7 +967,7 @@ function App() {
 
   // ---------- checkpoint selection ----------
 
-  const selectCheckpoint = useCallback(async (id) => {
+  const selectCheckpoint = useCallback(async (id, preferredPath = null) => {
     setSelectedCkpt(id);
     setSelectedFile(null);
     setFiles([]); setDiff(null); setPrompt(null);
@@ -757,7 +980,10 @@ function App() {
     setPrompt(promptResp?.prompt || null);
     if (Array.isArray(filesResp)) {
       setFiles(filesResp);
-      if (filesResp.length) selectFile(id, filesResp[0].path);
+      const target = (preferredPath && filesResp.find(f => f.path === preferredPath))
+        ? preferredPath
+        : filesResp[0]?.path;
+      if (target) selectFile(id, target);
     }
   }, [selectedProject]);
 
@@ -780,6 +1006,64 @@ function App() {
       selectCheckpoint(checkpoints[0].id);
     }
   }, [checkpoints, selectedCkpt, selectCheckpoint]);
+
+  // Run a search whenever the query (or any option) changes. Debounced so
+  // a fast typer doesn't fire one HTTP round-trip per keystroke.
+  useEffect(() => {
+    if (!searchQuery.trim()) {
+      setSearchResults(null); setSearchError(null); setSearchBusy(false);
+      return;
+    }
+    const seq = ++searchSeqRef.current;
+    setSearchBusy(true); setSearchError(null);
+    const t = setTimeout(async () => {
+      try {
+        const r = await api.post('/api/search', {
+          query: searchQuery,
+          regex: searchRegex,
+          scope: searchOptions.scope,
+          project_ids: searchOptions.project_ids,
+          since: searchOptions.since,
+          until: searchOptions.until,
+          mode: searchOptions.mode,
+          max_results: 1000,
+        });
+        if (seq !== searchSeqRef.current) return;   // a newer search superseded us
+        if (r?.ok) setSearchResults(r);
+        else { setSearchResults(null); setSearchError(r?.error || 'search failed'); }
+      } catch (e) {
+        if (seq !== searchSeqRef.current) return;
+        setSearchError(String(e?.message || e)); setSearchResults(null);
+      } finally {
+        if (seq === searchSeqRef.current) setSearchBusy(false);
+      }
+    }, 250);
+    return () => clearTimeout(t);
+  }, [searchQuery, searchRegex, searchOptions]);
+
+  // Close the filter panel when the user clicks outside it.
+  useEffect(() => {
+    if (!showSearchFilters) return;
+    const onDown = (e) => {
+      if (e.target.closest('.search')) return;
+      setShowSearchFilters(false);
+    };
+    document.addEventListener('mousedown', onDown);
+    return () => document.removeEventListener('mousedown', onDown);
+  }, [showSearchFilters]);
+
+  // Cmd/Ctrl+K focuses the search input from anywhere.
+  useEffect(() => {
+    const onKey = (e) => {
+      if ((e.key === 'k' || e.key === 'K') && (e.metaKey || e.ctrlKey)) {
+        e.preventDefault();
+        searchInputRef.current?.focus();
+        searchInputRef.current?.select();
+      }
+    };
+    document.addEventListener('keydown', onKey);
+    return () => document.removeEventListener('keydown', onKey);
+  }, []);
 
   // ---------- actions ----------
 
@@ -1085,11 +1369,91 @@ function App() {
 
   const selCkpt = checkpoints.find(c => c.id === selectedCkpt);
 
+  // Derive filter sets from the latest search response. When the query is
+  // empty `searchFilter` is null and every column renders as normal.
+  //
+  // Visibility rules:
+  //   - A project shows up if anything in it matched.
+  //   - A checkpoint shows up if its message/prompt matched, or any of its
+  //     file diffs matched. If the project matched only by name (no children
+  //     hit), all of its checkpoints stay visible — otherwise selecting the
+  //     project would land on an empty list.
+  //   - A file shows up if its diff matched. If the checkpoint matched only
+  //     by message (no diff hit), all of its files stay visible. Same fall-
+  //     through applies when only the project matched.
+  const searchFilter = useMemo(() => {
+    if (!searchQuery.trim() || !searchResults?.matches) return null;
+    const allProjects = new Set();
+    const projectsWithChild = new Set();
+    const matchedCkpts = new Set();
+    const ckptsWithChild = new Set();
+    const matchedFiles = new Set();
+    for (const m of searchResults.matches) {
+      if (!m.project_id) continue;
+      allProjects.add(m.project_id);
+      if (m.kind === 'checkpoint' || m.kind === 'diff') {
+        projectsWithChild.add(m.project_id);
+        if (m.checkpoint_id) matchedCkpts.add(`${m.project_id}|${m.checkpoint_id}`);
+      }
+      if (m.kind === 'diff' && m.checkpoint_id) {
+        ckptsWithChild.add(`${m.project_id}|${m.checkpoint_id}`);
+        if (m.file_path) matchedFiles.add(`${m.project_id}|${m.checkpoint_id}|${m.file_path}`);
+      }
+    }
+    return {
+      isProjectVisible: (pid) => allProjects.has(pid),
+      isCheckpointVisible: (pid, cid) =>
+        !projectsWithChild.has(pid) || matchedCkpts.has(`${pid}|${cid}`),
+      isFileVisible: (pid, cid, path) => {
+        if (!projectsWithChild.has(pid)) return true;
+        if (!ckptsWithChild.has(`${pid}|${cid}`)) return true;
+        return matchedFiles.has(`${pid}|${cid}|${path}`);
+      },
+    };
+  }, [searchQuery, searchResults]);
+
+  const existingProjects = projects.filter(p => p.exists);
+  const visibleProjects = searchFilter
+    ? projects.filter(p => searchFilter.isProjectVisible(p.id))
+    : projects;
+  const visibleCheckpoints = (searchFilter && selectedProject)
+    ? checkpoints.filter(c => searchFilter.isCheckpointVisible(selectedProject, c.id))
+    : checkpoints;
+  const visibleFiles = (searchFilter && selectedProject && selectedCkpt)
+    ? files.filter(f => searchFilter.isFileVisible(selectedProject, selectedCkpt, f.path))
+    : files;
+  const matchCount = searchResults?.stats?.match_count ?? 0;
+  const highlight = useMemo(
+    () => makeHighlighter(searchQuery, searchRegex),
+    [searchQuery, searchRegex],
+  );
+
+  const countLabel = (visible, total) =>
+    searchFilter ? html`<span class="count">(${visible} / ${total})</span>`
+                 : html`<span class="count">(${total})</span>`;
+
   return html`
     <div class="app">
       <${Header}
         branch=${status.branch}
         live=${liveState}
+        search=${html`
+          <${SearchBar}
+            inputRef=${searchInputRef}
+            query=${searchQuery}
+            setQuery=${setSearchQuery}
+            regex=${searchRegex}
+            setRegex=${setSearchRegex}
+            options=${searchOptions}
+            updateOptions=${updateSearchOptions}
+            projects=${projects}
+            showFilters=${showSearchFilters}
+            setShowFilters=${setShowSearchFilters}
+            busy=${searchBusy}
+            error=${searchError}
+            matchCount=${searchQuery.trim() ? matchCount : null}
+            onReset=${resetSearchOptions}/>
+        `}
         onRefresh=${() => { refreshCkpts(true); refreshProjects(); }}
         onSettings=${() => setShowSettings(true)}
       />
@@ -1101,10 +1465,12 @@ function App() {
       />
       <div class="main">
         <div class="col">
-          <div class="col-header">Projects <span class="count">(${projects.filter(p => p.exists).length})</span></div>
+          <div class="col-header">Projects ${countLabel(
+            visibleProjects.filter(p => p.exists).length, existingProjects.length
+          )}</div>
           <div class="col-body">
             <${ProjectList}
-              projects=${projects}
+              projects=${visibleProjects}
               selectedId=${selectedProject}
               openMenuId=${openMenuId}
               onSelect=${setSelectedProject}
@@ -1113,33 +1479,38 @@ function App() {
               onPruneProject=${openPruneProject}
               onUndoProject=${openUndoProject}
               onCleanProject=${openCleanProject}
+              highlight=${highlight}
             />
           </div>
         </div>
         <div class="col">
-          <div class="col-header">Checkpoints <span class="count">(${checkpoints.length})</span></div>
+          <div class="col-header">Checkpoints ${countLabel(visibleCheckpoints.length, checkpoints.length)}</div>
           <div class="col-body">
             <${CheckpointList}
-              checkpoints=${checkpoints}
+              checkpoints=${visibleCheckpoints}
               selectedId=${selectedCkpt}
               newIds=${newIds}
               onSelect=${selectCheckpoint}
               onRestore=${openRestore}
               onDelete=${openDelete}
               onPruneHere=${openPruneHere}
+              highlight=${highlight}
             />
           </div>
         </div>
         <div class="main-right">
-          <${PromptPane} prompt=${prompt} ckpt=${selCkpt}/>
+          <${PromptPane} prompt=${prompt} ckpt=${selCkpt} highlight=${highlight}/>
           <div class="main-right-bottom">
             <${FilesList}
-              files=${files}
+              files=${visibleFiles}
+              totalFiles=${files.length}
+              filtering=${!!searchFilter}
               selectedFile=${selectedFile}
               ckptId=${selectedCkpt}
               ckpt=${selCkpt}
               onSelect=${(p) => selectFile(selectedCkpt, p)}
               onRestoreFile=${openRestoreFile}
+              highlight=${highlight}
             />
             <${DiffViewer} path=${selectedFile} text=${diff}/>
           </div>

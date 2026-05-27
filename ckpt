@@ -21,11 +21,11 @@ Modes:
 
 Storage:
     Per-project:
-        <project>/.claude/checkpoints.db        prompts + checkpoint metadata
-        <project>/.git/refs/claude-checkpoints  snapshot refs (immutable commits)
+        <project>/.git/refs/claude-checkpoints           snapshot refs (immutable commits)
     Per-machine:
-        ~/.local/share/ckpt/projects.db         index of known projects
-        ~/.local/share/ckpt/web/                web UI assets (installed by install.sh)
+        ~/.local/share/ckpt/projects.db                  index of known projects
+        ~/.local/share/ckpt/projects/<id>/checkpoints.db prompts + checkpoint metadata
+        ~/.local/share/ckpt/web/                         web UI assets (installed by install.sh)
 """
 
 import argparse
@@ -43,6 +43,7 @@ import tempfile
 import threading
 import time
 import webbrowser
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs, unquote
 
@@ -50,7 +51,7 @@ from urllib.parse import urlparse, parse_qs, unquote
 
 REF_NS = "refs/claude-checkpoints"
 TRASH_REF = "refs/claude-checkpoints-trash/last"
-PROJECT_DB_REL = ".claude/checkpoints.db"
+PROJECT_DB_REL = ".claude/checkpoints.db"  # legacy in-tree location, only used for migration
 
 USER_DATA_DIR = Path.home() / ".local" / "share" / "ckpt"
 PROJECTS_DB = USER_DATA_DIR / "projects.db"
@@ -86,9 +87,54 @@ def claude_project_dir():
 
 
 # ---------------- per-project db ----------------
+#
+# The DB lives under USER_DATA_DIR (out of the working tree) so a checkpoint
+# restore can never wipe it. Older installs kept it at `<project>/.claude/
+# checkpoints.db`; the first call into `project_db_path` migrates that file
+# (and its SQLite sidecars) into the new location.
+
+def project_data_dir(root):
+    pid = project_id_for(root)
+    return USER_DATA_DIR / "projects" / pid
+
+
+_MIGRATED_DB_ROOTS = set()
+_MIGRATED_DB_LOCK = threading.Lock()
+
+
+def _migrate_in_tree_db(root):
+    """Move `<root>/.claude/checkpoints.db*` into the new per-project data
+    dir. Idempotent; safe to call from any code path that touches the DB."""
+    with _MIGRATED_DB_LOCK:
+        if root in _MIGRATED_DB_ROOTS:
+            return
+        _MIGRATED_DB_ROOTS.add(root)
+    new_dir = project_data_dir(root)
+    new_dir.mkdir(parents=True, exist_ok=True)
+    for rel in (PROJECT_DB_REL,
+                PROJECT_DB_REL + "-journal",
+                PROJECT_DB_REL + "-wal",
+                PROJECT_DB_REL + "-shm"):
+        src = Path(root) / rel
+        if not src.exists():
+            continue
+        dst = new_dir / Path(rel).name
+        if dst.exists():
+            # New location already has data — assume it's the live one and
+            # discard the stray in-tree copy (probably re-materialized by a
+            # restore of a pre-migration snapshot).
+            try: src.unlink()
+            except Exception: pass
+            continue
+        try:
+            shutil.move(str(src), str(dst))
+        except Exception:
+            pass
+
 
 def project_db_path(root):
-    return Path(root) / PROJECT_DB_REL
+    _migrate_in_tree_db(root)
+    return project_data_dir(root) / "checkpoints.db"
 
 
 PROJECT_SCHEMA = """
@@ -234,35 +280,31 @@ def _strip_db_from_index(root, env):
     )
 
 
-def _save_db(root):
-    """Snapshot the current project DB to a temp file. Returns the temp path or None."""
-    db_path = project_db_path(root)
-    if not db_path.exists():
-        return None
-    bk = tempfile.NamedTemporaryFile(delete=False, prefix="ckpt-db-", suffix=".db")
-    bk.close()
-    try:
-        shutil.copyfile(str(db_path), bk.name)
-        return bk.name
-    except Exception:
-        try: os.unlink(bk.name)
-        except Exception: pass
-        return None
+def _purge_in_tree_db(root):
+    """Delete any `<root>/.claude/checkpoints.db*` that surfaced in the
+    working tree (and stage that deletion in the index) after restoring an
+    older snapshot.
 
-
-def _restore_db(root, backup_path):
-    """Put the DB back to its pre-op state. backup_path None => ensure DB absent."""
-    db_path = project_db_path(root)
-    if backup_path:
+    Modern snapshots strip the DB before commit, but pre-migration trees
+    embed it. The live DB lives in USER_DATA_DIR and is untouched by
+    read-tree — anything that lands in `.claude/` is stale and should go.
+    """
+    removed_any = False
+    for rel in _DB_EXCLUDE_PATHS:
         try:
-            shutil.copyfile(backup_path, str(db_path))
+            os.unlink(os.path.join(root, rel))
+            removed_any = True
+        except FileNotFoundError:
+            pass
         except Exception:
             pass
-        try: os.unlink(backup_path)
-        except Exception: pass
-    elif db_path.exists():
-        try: db_path.unlink()
-        except Exception: pass
+    if removed_any:
+        # Drop the entries from the index so `git status` doesn't flag them
+        # as deleted-against-the-restored-tree.
+        subprocess.run(
+            ["git", "rm", "--cached", "--ignore-unmatch", "--quiet", "--", *_DB_EXCLUDE_PATHS],
+            capture_output=True, cwd=root,
+        )
 
 
 def _remove_untracked_after_restore(root):
@@ -445,21 +487,19 @@ def op_restore_full(root, ref, delete_later=False):
     # checkpoint whose timestamp sorts after the target. The pre-restore
     # safety snapshot is always saved so `ckpt undo` can recover state.
     #
-    # The project's SQLite DB is preserved across the read-tree: older
-    # checkpoints (created before the DB-exclusion fix) embed a stale copy
-    # of the DB in their tree, and a naive read-tree would wipe prompt
-    # history for the restored checkpoint and every later one.
+    # The project's SQLite DB lives in USER_DATA_DIR, out of the working
+    # tree, so read-tree can't touch it. Pre-migration snapshots embedded
+    # `.claude/checkpoints.db` in their tree, though, and a restore of one
+    # would materialize that stale copy in the working tree — _purge_in_tree_db
+    # cleans it up so the moved-out DB stays the sole source of truth.
     safety = make_snapshot_commit(root, f"pre-restore safety ({time.strftime('%Y-%m-%d %H:%M:%S')})")
     if safety:
         git("update-ref", TRASH_REF, safety, cwd=root)
 
-    db_backup = _save_db(root)
     _, err, code = git("read-tree", "--reset", "-u", ref, cwd=root)
     if code != 0:
-        # Restore DB so we don't leave half-baked state behind.
-        _restore_db(root, db_backup)
         return {"ok": False, "error": (err or "read-tree failed").strip()}
-    _restore_db(root, db_backup)
+    _purge_in_tree_db(root)
     _remove_untracked_after_restore(root)
 
     deleted = 0
@@ -532,16 +572,264 @@ def op_clean(root):
 def op_undo(root):
     if not has_trash(root):
         return {"ok": False, "error": "no recent restore to undo"}
-    # Same DB-preservation discipline as op_restore_full: an older safety
-    # snapshot might embed the DB; don't let it clobber current prompt history.
-    db_backup = _save_db(root)
     _, err, code = git("read-tree", "--reset", "-u", TRASH_REF, cwd=root)
     if code != 0:
-        _restore_db(root, db_backup)
         return {"ok": False, "error": err.strip() or "read-tree failed"}
-    _restore_db(root, db_backup)
+    _purge_in_tree_db(root)
     _remove_untracked_after_restore(root)
     return {"ok": True}
+
+
+# ---------------- global search ----------------
+
+# Per-checkpoint cap when searching diffs. A combined diff for a big sweeping
+# refactor can easily run into the megabytes; reading the whole thing into
+# memory for every checkpoint × every project would make the UI feel laggy.
+# 512 KB is more than enough to catch substring matches in any normally-sized
+# turn and keeps the worst-case latency bounded.
+_SEARCH_DIFF_BYTE_CAP = 512 * 1024
+_SEARCH_SNIPPET_BEFORE = 60
+_SEARCH_SNIPPET_AFTER  = 120
+
+# Diff text per (root, ref) is immutable — checkpoint refs are write-once.
+# We pay the `git diff` cost the first time a checkpoint is searched and
+# every subsequent search reuses the cached text. Bounded only by checkpoint
+# count; cleared lazily when refs disappear from `list_checkpoints`.
+_SEARCH_DIFF_CACHE = {}
+_SEARCH_DIFF_CACHE_LOCK = threading.Lock()
+
+
+def _fetch_diff_cached(root, ref):
+    key = (root, ref)
+    with _SEARCH_DIFF_CACHE_LOCK:
+        cached = _SEARCH_DIFF_CACHE.get(key)
+    if cached is not None:
+        return cached
+    out, _, _ = git("diff", f"{ref}^", ref, cwd=root)
+    if len(out) > _SEARCH_DIFF_BYTE_CAP:
+        out = out[:_SEARCH_DIFF_BYTE_CAP]
+    with _SEARCH_DIFF_CACHE_LOCK:
+        _SEARCH_DIFF_CACHE[key] = out
+    return out
+
+
+def _prune_diff_cache(root, live_ckpt_ids):
+    """Drop cached diffs for refs that no longer exist in the project."""
+    live_refs = {f"{REF_NS}/{cid}" for cid in live_ckpt_ids}
+    with _SEARCH_DIFF_CACHE_LOCK:
+        stale = [k for k in _SEARCH_DIFF_CACHE
+                 if k[0] == root and k[1] not in live_refs]
+        for k in stale:
+            _SEARCH_DIFF_CACHE.pop(k, None)
+
+
+def _prompts_for_ckpts(root, ckpt_ids):
+    """One SQLite open per project instead of one per checkpoint."""
+    if not ckpt_ids:
+        return {}
+    conn = project_db_connect(root, create=False)
+    if not conn:
+        return {}
+    out = {}
+    try:
+        # SQLite caps parameter count around 999 by default; chunk to stay clear.
+        for i in range(0, len(ckpt_ids), 800):
+            chunk = ckpt_ids[i:i + 800]
+            placeholders = ",".join("?" * len(chunk))
+            for cid, prompt in conn.execute(
+                f"SELECT id, prompt FROM checkpoints WHERE id IN ({placeholders})",
+                chunk,
+            ):
+                if prompt:
+                    out[cid] = prompt
+    except Exception:
+        pass
+    finally:
+        try: conn.close()
+        except Exception: pass
+    return out
+
+
+def _snippet(text, match, before=_SEARCH_SNIPPET_BEFORE, after=_SEARCH_SNIPPET_AFTER):
+    if not text:
+        return ""
+    if match is None:
+        return text[: before + after]
+    s = max(0, match.start() - before)
+    e = min(len(text), match.end() + after)
+    return ("…" if s > 0 else "") + text[s:e] + ("…" if e < len(text) else "")
+
+
+def _split_diff_by_file(diff_text):
+    """Yield (path, body) for each file in a combined `git diff` output."""
+    cur_path, cur_lines, header_done = None, [], False
+    for line in diff_text.splitlines():
+        m = re.match(r"^diff --git a/(.*) b/(.*)$", line)
+        if m:
+            if cur_path is not None:
+                yield cur_path, "\n".join(cur_lines)
+            cur_path = m.group(2)
+            cur_lines = []
+            header_done = False
+            continue
+        # Skip the per-file header noise so snippet positions align with
+        # what the diff viewer actually shows.
+        if not header_done and re.match(r"^(index |new file|deleted file|rename |similarity |Binary |--- |\+\+\+ )", line):
+            continue
+        header_done = True
+        cur_lines.append(line)
+    if cur_path is not None:
+        yield cur_path, "\n".join(cur_lines)
+
+
+def op_search(query, *, regex=False, scope=None, project_ids=None,
+              since=None, until=None, mode="include", max_results=200):
+    """Search across every registered project's checkpoints.
+
+    Returns matches in three flavors: `project` (project name/path hit),
+    `checkpoint` (commit-message / prompt hit), and `diff` (a hit inside a
+    file's diff for some checkpoint). `mode="exclude"` flips the predicate
+    so a hit means *no match* in that scope — useful for "checkpoints that
+    don't mention X".
+
+    Date filters use the checkpoint id (`YYYYMMDD-HHMMSS`), which sorts
+    chronologically. `since`/`until` are accepted as ISO-ish strings; only
+    the digits are kept so callers can pass `2026-05-20` or
+    `2026-05-20T10:00`.
+    """
+    q = query or ""
+    if not q:
+        return {"ok": False, "error": "empty query"}
+
+    try:
+        flags = 0 if regex else re.IGNORECASE
+        pattern = re.compile(q if regex else re.escape(q), flags)
+    except re.error as e:
+        return {"ok": False, "error": f"invalid regex: {e}"}
+
+    scope = scope or {}
+    want_projects    = scope.get("projects",    True)
+    want_checkpoints = scope.get("checkpoints", True)
+    want_diffs       = scope.get("diffs",       True)
+    invert           = (mode == "exclude")
+    pid_filter       = set(project_ids) if project_ids else None
+
+    def _norm_date(s):
+        if not s:
+            return None
+        digits = re.sub(r"\D", "", str(s))
+        return digits or None
+    since_n = _norm_date(since)
+    until_n = _norm_date(until)
+
+    def _in_range(ckpt_id):
+        # `ckpt_id` is `YYYYMMDD-HHMMSS`; drop the dash to get a sortable string.
+        cid = re.sub(r"\D", "", ckpt_id)
+        if since_n and cid < since_n[: len(cid)]:
+            return False
+        if until_n:
+            tail = cid[: len(until_n)]
+            if tail > until_n:
+                return False
+        return True
+
+    matches = []
+    stats = {"projects_searched": 0, "checkpoints_searched": 0,
+             "diffs_searched": 0, "match_count": 0}
+
+    def _push(item):
+        matches.append(item)
+        stats["match_count"] += 1
+        return len(matches) >= max_results
+
+    # One executor for the whole search. Diff fetching is `git diff`-bound,
+    # which is IO/process-startup heavy — running 8 in parallel cuts wall
+    # time roughly to (N / 8) × per-call cost instead of N × per-call.
+    pool = ThreadPoolExecutor(max_workers=8)
+    try:
+        for proj in list_projects(include_missing=False):
+            if pid_filter and proj["id"] not in pid_filter:
+                continue
+            stats["projects_searched"] += 1
+            root = proj["path"]
+            pname = proj.get("name") or os.path.basename(proj["path"])
+
+            if want_projects:
+                hay = f"{pname}\n{proj['path']}"
+                m = pattern.search(hay)
+                if bool(m) != invert:
+                    if _push({
+                        "kind": "project",
+                        "project_id": proj["id"],
+                        "project_name": pname,
+                        "project_path": proj["path"],
+                        "snippet": _snippet(hay, m) if m else hay,
+                    }):
+                        return {"ok": True, "matches": matches, "stats": stats}
+
+            if not (want_checkpoints or want_diffs):
+                continue
+
+            try:
+                all_ckpts = list_checkpoints(root)
+            except Exception:
+                all_ckpts = []
+            _prune_diff_cache(root, [c["id"] for c in all_ckpts])
+            ckpts = [c for c in all_ckpts if _in_range(c["id"])]
+            stats["checkpoints_searched"] += len(ckpts)
+
+            # Pass 1 — checkpoint message + prompt (cheap, sequential).
+            if want_checkpoints:
+                prompts = _prompts_for_ckpts(root, [c["id"] for c in ckpts])
+                for c in ckpts:
+                    hay_parts = [c.get("message") or ""]
+                    p = prompts.get(c["id"])
+                    if p:
+                        hay_parts.append(p)
+                    hay = "\n".join(hay_parts)
+                    m = pattern.search(hay)
+                    if bool(m) != invert:
+                        if _push({
+                            "kind": "checkpoint",
+                            "project_id": proj["id"],
+                            "project_name": pname,
+                            "checkpoint_id": c["id"],
+                            "checkpoint_message": c.get("message"),
+                            "when": c.get("when"),
+                            "iso": c.get("iso"),
+                            "snippet": _snippet(hay, m) if m else hay,
+                        }):
+                            return {"ok": True, "matches": matches, "stats": stats}
+
+            # Pass 2 — diff content (one `git diff` per checkpoint on the
+            # first search, cached forever after — refs are immutable. The
+            # first call still runs them in parallel because subprocess
+            # startup dominates each one.).
+            if want_diffs and ckpts:
+                stats["diffs_searched"] += len(ckpts)
+                def _fetch(c, _root=root):
+                    ref = c.get("ref") or f"{REF_NS}/{c['id']}"
+                    return c, _fetch_diff_cached(_root, ref)
+                for c, diff_out in pool.map(_fetch, ckpts):
+                    for path, body in _split_diff_by_file(diff_out):
+                        m = pattern.search(body)
+                        if bool(m) != invert:
+                            snippet = _snippet(body, m) if m else body[:200]
+                            if _push({
+                                "kind": "diff",
+                                "project_id": proj["id"],
+                                "project_name": pname,
+                                "checkpoint_id": c["id"],
+                                "when": c.get("when"),
+                                "iso": c.get("iso"),
+                                "file_path": path,
+                                "snippet": snippet,
+                            }):
+                                return {"ok": True, "matches": matches, "stats": stats}
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
+
+    return {"ok": True, "matches": matches, "stats": stats}
 
 
 def cleanup_orphan_rows(root):
@@ -992,7 +1280,9 @@ def cmd_migrate():
             settings_path.write_text(json.dumps(data, indent=2) + "\n")
             print("  cleaned: .claude/settings.json (hooks block)")
 
-    print("  kept:    .claude/checkpoints.db (your data)")
+    new_db = project_db_path(Path(root))
+    if new_db.exists():
+        print(f"  moved:   .claude/checkpoints.db → {new_db}")
     print("  kept:    refs/claude-checkpoints/* (your snapshots)")
     print()
     print("Migration done. The global hook in ~/.claude/settings.json now handles this project.")
@@ -1282,6 +1572,24 @@ class UIHandler(http.server.BaseHTTPRequestHandler):
         try:
             if p == "/api/update":
                 self._send_json(op_self_update()); return
+
+            if p == "/api/search":
+                data = self._read_json()
+                try:
+                    max_results = max(1, min(1000, int(data.get("max_results", 200))))
+                except Exception:
+                    max_results = 200
+                self._send_json(op_search(
+                    query=str(data.get("query") or ""),
+                    regex=bool(data.get("regex", False)),
+                    scope=data.get("scope") or None,
+                    project_ids=data.get("project_ids") or None,
+                    since=data.get("since") or None,
+                    until=data.get("until") or None,
+                    mode=str(data.get("mode") or "include"),
+                    max_results=max_results,
+                ))
+                return
 
             m = re.match(r"^/api/projects/([^/]+)/checkpoints/([^/]+)/restore$", p)
             if m:

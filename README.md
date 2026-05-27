@@ -155,14 +155,20 @@ ckpt migrate                    Migrate an old in-repo .claude/ setup to this on
 ## How it works
 
 ```
-~/.local/bin/ckpt                            single Python entry, all modes
-~/.local/share/ckpt/web/                     UI assets (html + js + css)
-~/.local/share/ckpt/projects.db              per-machine index of known projects
-~/.claude/settings.json                      hooks registered here (user-global)
+~/.local/bin/ckpt                                 single Python entry, all modes
+~/.local/share/ckpt/web/                          UI assets (html + js + css)
+~/.local/share/ckpt/projects.db                   per-machine index of known projects
+~/.local/share/ckpt/projects/<id>/checkpoints.db  prompts + checkpoint metadata
+~/.claude/settings.json                           hooks registered here (user-global)
 
-<each project>/.claude/checkpoints.db        prompts + checkpoint metadata
-<each project>/.git/refs/claude-checkpoints/ snapshot refs (immutable commits)
+<each project>/.git/refs/claude-checkpoints/      snapshot refs (immutable commits)
 ```
+
+The per-project SQLite DB lives **outside** the project tree so a checkpoint
+restore can never wipe your prompt history. Older installs kept it at
+`<project>/.claude/checkpoints.db`; the first time the new binary touches a
+project, that file (plus any `-journal`/`-wal`/`-shm` sidecars) is migrated
+into the user data dir automatically.
 
 - A `UserPromptSubmit` hook saves the **full** user prompt into the project's local SQLite database.
 - A `Stop` hook fires after each assistant turn. It builds a snapshot using a temporary index + `git add -A` + `git commit-tree` so modifications, deletions, AND new files (respecting `.gitignore`) all land in the tree. The live index and working tree are untouched.
@@ -183,20 +189,7 @@ This:
 1. Registers the project in the per-machine index
 2. Removes the in-repo hook scripts, CLI, UI, and CHECKPOINTS.md
 3. Strips the redundant `hooks` block from the project's `.claude/settings.json`
-4. **Keeps** `.claude/checkpoints.db` and `refs/claude-checkpoints/*` — your data isn't touched
-
-## `.gitignore` recommendation
-
-Add to each project:
-
-```
-.claude/checkpoints.db
-.claude/checkpoints.db-journal
-.claude/checkpoints.db-wal
-.claude/checkpoints.db-shm
-```
-
-(Per-machine prompt history — not something you want committed.)
+4. **Keeps** `refs/claude-checkpoints/*` and migrates `.claude/checkpoints.db` to `~/.local/share/ckpt/projects/<id>/checkpoints.db` — your data isn't touched
 
 ## Uninstall
 
