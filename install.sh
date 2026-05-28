@@ -15,6 +15,7 @@ set -e
 INSTALL_BIN="${INSTALL_BIN:-$HOME/.local/bin}"
 INSTALL_DATA="${INSTALL_DATA:-$HOME/.local/share/ckpt}"
 CLAUDE_SETTINGS="${CLAUDE_SETTINGS:-$HOME/.claude/settings.json}"
+CODEX_CONFIG="${CODEX_CONFIG:-$HOME/.codex/config.toml}"
 REPO="${CKPT_REPO:-Kassan424kh/ckpt}"
 REF="${CKPT_REF:-main}"
 
@@ -104,7 +105,51 @@ else:
     print(f"    already registered in {settings_path}")
 PY
 
-# 4) PATH sanity check.
+# 4) If Codex CLI is installed, register the equivalent hooks in its config.
+#    Idempotent: we look for our exact command strings before appending.
+if [ -d "$HOME/.codex" ] || command -v codex >/dev/null 2>&1; then
+  mkdir -p "$(dirname "$CODEX_CONFIG")"
+  python3 - "$CODEX_CONFIG" <<'PY'
+import sys
+from pathlib import Path
+
+cfg_path = Path(sys.argv[1])
+existing = cfg_path.read_text() if cfg_path.exists() else ""
+
+# Each hook is identified by its command string; if that string already
+# appears verbatim in the file we skip it. We never rewrite or reorder
+# existing TOML — only append our blocks at the end.
+WANT = [
+    ("UserPromptSubmit", "ckpt --hook save-prompt --source codex"),
+    ("Stop",             "ckpt --hook checkpoint  --source codex"),
+]
+
+to_add = [(event, cmd) for event, cmd in WANT if cmd not in existing]
+if not to_add:
+    print(f"    already registered in {cfg_path}")
+    sys.exit(0)
+
+block = []
+if existing and not existing.endswith("\n"):
+    block.append("")
+block.append("# --- ckpt hooks (added by ckpt installer) ---")
+for event, cmd in to_add:
+    block.append(f"[[hooks.{event}]]")
+    block.append(f"[[hooks.{event}.hooks]]")
+    block.append('type = "command"')
+    block.append(f'command = {cmd!r}')
+    block.append("timeout = 30")
+    block.append("")
+
+cfg_path.write_text(existing + "\n".join(block))
+print(f"    registered: {' + '.join(e for e, _ in to_add)} -> {cfg_path}")
+PY
+else
+  echo "    Codex CLI not detected (~/.codex missing) — skipping codex hooks."
+  echo "    Install codex later, then re-run ./install.sh to register them."
+fi
+
+# 5) PATH sanity check.
 case ":$PATH:" in
   *":$INSTALL_BIN:"*) ;;
   *) echo

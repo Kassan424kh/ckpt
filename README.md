@@ -159,7 +159,8 @@ ckpt migrate                    Migrate an old in-repo .claude/ setup to this on
 ~/.local/share/ckpt/web/                          UI assets (html + js + css)
 ~/.local/share/ckpt/projects.db                   per-machine index of known projects
 ~/.local/share/ckpt/projects/<id>/checkpoints.db  prompts + checkpoint metadata
-~/.claude/settings.json                           hooks registered here (user-global)
+~/.claude/settings.json                           Claude Code hooks (user-global)
+~/.codex/config.toml                              Codex CLI hooks (user-global, if installed)
 
 <each project>/.git/refs/claude-checkpoints/      snapshot refs (immutable commits)
 ```
@@ -174,6 +175,24 @@ into the user data dir automatically.
 - A `Stop` hook fires after each assistant turn. It builds a snapshot using a temporary index + `git add -A` + `git commit-tree` so modifications, deletions, AND new files (respecting `.gitignore`) all land in the tree. The live index and working tree are untouched.
 - The snapshot's first-line message becomes the git commit message; the full prompt is recorded alongside in SQLite.
 - Aggregate diff stats (`+N / −M / F files`) are computed once at creation and cached.
+
+### Multi-agent support (Claude Code + Codex CLI)
+
+The installer registers the same two hooks in both agents that ship a hook
+system today:
+
+- **Claude Code** — `~/.claude/settings.json`, command `ckpt --hook ...`.
+- **Codex CLI** — `~/.codex/config.toml`, command `ckpt --hook ... --source codex`.
+
+Each checkpoint records the agent that produced it (`--source claude` is the
+default). The Web UI color-codes the dot in each checkpoint row — terra-cotta
+for Claude turns, blue for Codex turns — so you can tell at a glance which
+agent touched the project. If you run a third agent that can shell out on
+turn completion, pass `--source <name>` and it'll show up with a neutral dot
+and the literal source name in a tooltip.
+
+Codex hook setup is skipped automatically when `~/.codex/` doesn't exist;
+install Codex later and re-run `./install.sh` to pick it up.
 
 ## Migration from per-project install
 

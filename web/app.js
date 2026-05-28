@@ -72,6 +72,44 @@ const apiBase = (pid) => `/api/projects/${encodeURIComponent(pid)}`;
 
 function classes(...xs) { return xs.filter(Boolean).join(' '); }
 
+// ---------- multi-select ----------
+//
+// Same model in every column: a Set of selected ids + an "anchor" (the
+// last-clicked row, used as the pivot for shift-range selection). Plain
+// click resets the set to {id} AND fires the column's navigation callback.
+// Cmd/Ctrl click toggles `id` in/out of the set without navigating. Shift
+// click selects the range `[anchor..id]` from the column's visible-rows
+// array. Caller decides whether to fire navigation based on the modifier.
+
+const EMPTY_SELECTION = { ids: new Set(), anchor: null };
+
+function isMultiClick(e) {
+  return !!(e && (e.shiftKey || e.metaKey || e.ctrlKey));
+}
+
+// Shift-click would otherwise paint a native text selection from the
+// anchor row to the clicked row. preventDefault on the mousedown stops the
+// browser from starting a selection; the click event still fires with
+// shiftKey set so our range-select logic runs.
+const suppressShiftSelect = (e) => { if (e.shiftKey) e.preventDefault(); };
+
+function selectionFromClick(prev, id, orderedIds, e) {
+  if (e && e.shiftKey && prev.anchor != null) {
+    const a = orderedIds.indexOf(prev.anchor);
+    const b = orderedIds.indexOf(id);
+    if (a >= 0 && b >= 0) {
+      const [lo, hi] = a <= b ? [a, b] : [b, a];
+      return { ids: new Set(orderedIds.slice(lo, hi + 1)), anchor: prev.anchor };
+    }
+  }
+  if (e && (e.metaKey || e.ctrlKey)) {
+    const ids = new Set(prev.ids);
+    if (ids.has(id)) ids.delete(id); else ids.add(id);
+    return { ids, anchor: id };
+  }
+  return { ids: new Set([id]), anchor: id };
+}
+
 // Wrap each match of `query` in `text` with a <mark> so the column rows can
 // show *what* matched, not just that something did. Returns the text unchanged
 // when the query is empty or the regex is invalid — callers can drop it in
@@ -327,10 +365,14 @@ function SearchBar({
 
 const SETTINGS_KEY = 'ckpt.settings';
 function loadSettings() {
-  const defaults = { deleteLater: false, autoUpdate: false };
+  const defaults = { deleteLater: false, autoUpdate: false, hiddenSources: [], favoritesOnly: false };
   try {
     const s = JSON.parse(localStorage.getItem(SETTINGS_KEY) || '{}');
-    return { ...defaults, ...s };
+    return {
+      ...defaults, ...s,
+      hiddenSources: Array.isArray(s.hiddenSources) ? s.hiddenSources : defaults.hiddenSources,
+      favoritesOnly: !!s.favoritesOnly,
+    };
   } catch { return defaults; }
 }
 function saveSettings(s) {
@@ -419,16 +461,21 @@ function ProjectList({
   onOpenMenu, onCloseMenu,
   onPruneProject, onUndoProject, onCleanProject,
   highlight = (t) => t,
+  multiIds,
 }) {
   if (!projects.length) {
     return html`<div class="empty">no projects yet — run Claude in a git repo</div>`;
   }
+  const selected = multiIds || new Set();
   return html`
     <div>
       ${projects.map((p, i) => html`
         <div key=${p.id}
-             class=${classes('project', selectedId === p.id && 'selected', !p.exists && 'missing')}
-             onClick=${() => p.exists && onSelect(p.id)}
+             class=${classes('project', selectedId === p.id && 'selected',
+                             selected.has(p.id) && 'multi-selected',
+                             !p.exists && 'missing')}
+             onMouseDown=${suppressShiftSelect}
+             onClick=${(e) => p.exists && onSelect(p.id, e)}
              title=${p.exists ? p.path : 'directory missing'}>
           ${p.exists ? html`
             <button class="kebab"
@@ -471,13 +518,28 @@ function StatsRow({ stats }) {
   return html`<div class="stats">${withSeps}</div>`;
 }
 
-function CheckpointRow({ ckpt, index, total, selected, isNew, onSelect, onRestore, onDelete, onPruneHere, highlight = (t) => t }) {
+function CheckpointRow({ ckpt, index, total, selected, multi, isNew, onSelect, onRestore, onDelete, onPruneHere, onStar, highlight = (t) => t }) {
   // The last visible row is the oldest; pruning there would keep everything → disable.
   const isOldest = index === total;
+  // Source-aware row class: `source-codex` recolors the left stripe blue,
+  // `source-claude` (or missing source) keeps the terra-cotta. Unknown
+  // sources get a neutral stripe and the literal source name as a tooltip
+  // on hover — see styles.css.
+  const source = (ckpt.source || 'claude').toLowerCase();
+  const sourceClass = `source-${source}`;
+  const starred = !!ckpt.starred;
   return html`
-    <div class=${classes('checkpoint', selected && 'selected', isNew && 'new')}
+    <div class=${classes('checkpoint', sourceClass, selected && 'selected',
+                         multi && 'multi-selected', isNew && 'new', starred && 'starred')}
+         title=${`source: ${source}`}
+         onMouseDown=${suppressShiftSelect}
          onClick=${onSelect}>
       <div class="row1">
+        <button class=${classes('star', starred && 'on')}
+                title=${starred ? 'Unfavorite' : 'Mark as favorite'}
+                onClick=${(e) => { e.stopPropagation(); onStar(!starred); }}>
+          <span class="icon sm">${starred ? 'star' : 'star_outline'}</span>
+        </button>
         <span class="list-index">#${index}</span>
         <span class="when">${ckpt.when}</span>
         <span class="id">${ckpt.id}</span>
@@ -499,10 +561,11 @@ function CheckpointRow({ ckpt, index, total, selected, isNew, onSelect, onRestor
   `;
 }
 
-function CheckpointList({ checkpoints, selectedId, newIds, onSelect, onRestore, onDelete, onPruneHere, highlight }) {
+function CheckpointList({ checkpoints, selectedId, newIds, onSelect, onRestore, onDelete, onPruneHere, onStar, highlight, multiIds }) {
   if (!checkpoints.length) {
     return html`<div class="empty">no checkpoints yet — the Stop hook creates one after each turn</div>`;
   }
+  const selected = multiIds || new Set();
   return html`
     <div>
       ${checkpoints.map((c, i) => html`
@@ -512,15 +575,149 @@ function CheckpointList({ checkpoints, selectedId, newIds, onSelect, onRestore, 
           index=${i + 1}
           total=${checkpoints.length}
           selected=${selectedId === c.id}
+          multi=${selected.has(c.id)}
           isNew=${newIds.has(c.id)}
-          onSelect=${() => onSelect(c.id)}
+          onSelect=${(e) => onSelect(c.id, e)}
           onRestore=${() => onRestore(c)}
           onDelete=${() => onDelete(c)}
           onPruneHere=${() => onPruneHere(c, i + 1)}
+          onStar=${(val) => onStar(c.id, val)}
           highlight=${highlight}
         />
       `)}
     </div>
+  `;
+}
+
+// ---------- bulk action bar ----------
+//
+// Shown above a column's body when more than one row is multi-selected.
+// `actions` is an array of `{label, icon, onClick, danger?}` objects; all
+// of them collapse into a single "more_horiz" button that opens a menu —
+// keeps the bar compact regardless of how many actions a column ships.
+
+function BulkActionBar({ count, label, actions, onClear }) {
+  const [open, setOpen] = useState(false);
+  const menuRef = useRef(null);
+  useEffect(() => {
+    if (!open) return;
+    const onDown = (e) => {
+      if (menuRef.current?.contains(e.target)) return;
+      setOpen(false);
+    };
+    document.addEventListener('mousedown', onDown);
+    return () => document.removeEventListener('mousedown', onDown);
+  }, [open]);
+  if (!count || count < 2) return null;
+  const items = (actions || []).filter(Boolean);
+  return html`
+    <div class="bulk-bar">
+      <span class="bulk-count">${count} ${label}</span>
+      <span class="bulk-spacer"></span>
+      ${items.length ? html`
+        <span class="bulk-actions" ref=${menuRef}>
+          <button class=${classes('bulk-actions-btn', open && 'open')}
+                  title="Actions"
+                  onClick=${(e) => { e.stopPropagation(); setOpen(o => !o); }}>
+            <span class="icon sm">more_horiz</span>
+          </button>
+          ${open ? html`
+            <div class="bulk-actions-menu">
+              ${items.map((a, i) => html`
+                <button key=${i}
+                        class=${classes('bulk-actions-item', a.danger && 'danger')}
+                        onClick=${() => { setOpen(false); a.onClick?.(); }}>
+                  ${a.icon ? html`<span class="icon sm">${a.icon}</span>` : null}
+                  <span>${a.label}</span>
+                </button>
+              `)}
+            </div>
+          ` : null}
+        </span>
+      ` : null}
+      <button class="bulk-clear" title="Clear selection" onClick=${onClear}>
+        <span class="icon sm">close</span>
+      </button>
+    </div>
+  `;
+}
+
+// ---------- source filter (Checkpoints column header) ----------
+
+const KNOWN_SOURCES = ['claude', 'codex'];
+
+// Order matters: known agents come first so the popup reads consistently;
+// extra sources discovered in the data are appended in encounter order.
+function collectSourceOptions(checkpoints) {
+  const seen = new Map();
+  for (const k of KNOWN_SOURCES) seen.set(k, true);
+  for (const c of checkpoints) {
+    const s = (c.source || 'claude').toLowerCase();
+    if (!seen.has(s)) seen.set(s, true);
+  }
+  return [...seen.keys()];
+}
+
+function SourceFilterButton({ checkpoints, hiddenSources, setHidden, favoritesOnly, setFavoritesOnly }) {
+  const [open, setOpen] = useState(false);
+  const ref = useRef(null);
+  useEffect(() => {
+    if (!open) return;
+    const onDown = (e) => {
+      if (ref.current?.contains(e.target)) return;
+      setOpen(false);
+    };
+    document.addEventListener('mousedown', onDown);
+    return () => document.removeEventListener('mousedown', onDown);
+  }, [open]);
+  const options = collectSourceOptions(checkpoints);
+  const hidden = new Set(hiddenSources || []);
+  const toggle = (src) => {
+    const next = new Set(hidden);
+    if (next.has(src)) next.delete(src); else next.add(src);
+    setHidden([...next]);
+  };
+  const showAll  = () => setHidden([]);
+  const hideAll  = () => setHidden(options);
+  // Active count = any source hidden + favorites-only on. Drives the badge.
+  const activeFilters = hidden.size + (favoritesOnly ? 1 : 0);
+  return html`
+    <span class="source-filter" ref=${ref}>
+      <button class=${classes('source-filter-btn', activeFilters && 'active')}
+              title="Filter checkpoints"
+              onClick=${(e) => { e.stopPropagation(); setOpen(o => !o); }}>
+        <span class="icon sm">filter_list</span>
+        ${activeFilters ? html`<span class="source-filter-badge">${activeFilters}</span>` : null}
+      </button>
+      ${open ? html`
+        <div class="source-filter-popup">
+          <div class="source-filter-title">Show</div>
+          <label class="source-filter-row source-favorite">
+            <input type="checkbox" checked=${!!favoritesOnly}
+                   onChange=${(e) => setFavoritesOnly(e.currentTarget.checked)}/>
+            <span class="icon sm star-icon">star</span>
+            <span class="source-name">favorites only</span>
+          </label>
+          <div class="source-filter-sep"></div>
+          <div class="source-filter-title">Agent source</div>
+          ${options.map(src => {
+            const checked = !hidden.has(src);
+            return html`
+              <label key=${src} class=${classes('source-filter-row', `source-${src}`)}>
+                <input type="checkbox" checked=${checked}
+                       onChange=${() => toggle(src)}/>
+                <span class="source-swatch"></span>
+                <span class="source-name">${src}</span>
+              </label>
+            `;
+          })}
+          <div class="source-filter-actions">
+            <button class="search-link" onClick=${showAll}>show all</button>
+            <button class="search-link" onClick=${hideAll}>hide all</button>
+          </div>
+        </div>
+      ` : null}
+    </span>
   `;
 }
 
@@ -558,7 +755,7 @@ function PromptPane({ prompt, ckpt, highlight = (t) => t }) {
 
 // ---------- files column ----------
 
-function FilesList({ files, totalFiles, filtering, selectedFile, ckptId, ckpt, onSelect, onRestoreFile, highlight = (t) => t }) {
+function FilesList({ files, totalFiles, filtering, selectedFile, ckptId, ckpt, onSelect, onRestoreFile, highlight = (t) => t, multiPaths, bulkBar = null }) {
   const stats = ckpt?.stats;
   const headerStats = stats && (stats.insertions || stats.deletions) ? html`
     <span class="header-stats">
@@ -578,6 +775,7 @@ function FilesList({ files, totalFiles, filtering, selectedFile, ckptId, ckpt, o
         <span>Files ${countNode}</span>
         ${headerStats}
       </div>
+      ${bulkBar}
       <div class="col-body">
         ${!ckptId
           ? html`<div class="empty">select a checkpoint</div>`
@@ -587,10 +785,12 @@ function FilesList({ files, totalFiles, filtering, selectedFile, ckptId, ckpt, o
               ? html`<div class="empty">no files match the filter</div>`
               : files.map((f, i) => {
                 const s = (f.status || '?')[0];
+                const selected = (multiPaths || new Set()).has(f.path);
                 return html`
                   <div key=${f.path}
-                       class=${classes('file', selectedFile === f.path && 'selected')}
-                       onClick=${() => onSelect(f.path)}>
+                       class=${classes('file', selectedFile === f.path && 'selected', selected && 'multi-selected')}
+                       onMouseDown=${suppressShiftSelect}
+                       onClick=${(e) => onSelect(f.path, e)}>
                     <span class="list-index">#${i + 1}</span>
                     <span class=${`status ${s}`}>${s}</span>
                     <span class="path" title=${f.path}>${highlight(f.path)}</span>
@@ -781,6 +981,14 @@ function App() {
 
   // project-row kebab menu (one open at a time)
   const [openMenuId, setOpenMenuId] = useState(null);
+
+  // Per-column multi-selection. Plain click sets a single-row selection
+  // and fires the column's primary action (navigate); cmd/ctrl click
+  // toggles; shift click selects a range. Bulk action toolbars appear
+  // when more than one row is selected.
+  const [projSel,  setProjSel]  = useState(EMPTY_SELECTION);
+  const [ckptSel,  setCkptSel]  = useState(EMPTY_SELECTION);
+  const [fileSel,  setFileSel]  = useState(EMPTY_SELECTION);
   const updateSettings = useCallback((patch) => {
     setSettingsState(prev => { const s = { ...prev, ...patch }; saveSettings(s); return s; });
   }, []);
@@ -928,6 +1136,8 @@ function App() {
     lastIdsRef.current = new Set();
     setCheckpoints([]); setSelectedCkpt(null);
     setFiles([]); setSelectedFile(null); setDiff(null); setPrompt(null);
+    setCkptSel(EMPTY_SELECTION);
+    setFileSel(EMPTY_SELECTION);
     refreshCkpts(true);
   }, [selectedProject]);
 
@@ -971,6 +1181,8 @@ function App() {
     setSelectedCkpt(id);
     setSelectedFile(null);
     setFiles([]); setDiff(null); setPrompt(null);
+    // Switching checkpoints invalidates the file multi-selection.
+    setFileSel(EMPTY_SELECTION);
 
     const base = apiBase(selectedProject);
     const [promptResp, filesResp] = await Promise.all([
@@ -1106,6 +1318,51 @@ function App() {
     else toast(r?.error || 'restore failed', 'err');
   }, [selectedProject, selectedCkpt]);
 
+  // Toggle the favorite flag on a single checkpoint and refresh.
+  const doStar = useCallback(async (ckptId, starred) => {
+    if (!selectedProject || !ckptId) return;
+    const r = await api.post(`${apiBase(selectedProject)}/checkpoints/${encodeURIComponent(ckptId)}/star`, { starred });
+    if (r?.ok) refreshCkpts(true);
+    else toast(r?.error || 'failed to update favorite', 'err');
+  }, [selectedProject, refreshCkpts]);
+
+  const doBulkStar = useCallback(async (starred) => {
+    const ids = [...ckptSel.ids];
+    if (!selectedProject || !ids.length) return;
+    const r = await api.post(`${apiBase(selectedProject)}/checkpoints/bulk-star`, { ids, starred });
+    if (r?.ok) {
+      toast(`${starred ? 'favorited' : 'unfavorited'} ${r.updated}`, 'ok');
+      refreshCkpts(true);
+    } else toast(r?.error || 'bulk update failed', 'err');
+  }, [selectedProject, ckptSel, refreshCkpts]);
+
+  const doBulkDelete = useCallback(async () => {
+    setModal(null);
+    const ids = [...ckptSel.ids];
+    if (!selectedProject || !ids.length) return;
+    const r = await api.post(`${apiBase(selectedProject)}/checkpoints/bulk-delete`, { ids });
+    if (r?.ok) {
+      toast(`deleted ${r.deleted}`, 'ok');
+      setCkptSel(EMPTY_SELECTION);
+      if (ids.includes(selectedCkpt)) {
+        setSelectedCkpt(null); setFiles([]); setSelectedFile(null); setDiff(null); setPrompt(null);
+      }
+      refreshCkpts(true);
+    } else toast(r?.error || 'bulk delete failed', 'err');
+  }, [selectedProject, selectedCkpt, ckptSel, refreshCkpts]);
+
+  const doBulkRestoreFiles = useCallback(async () => {
+    setModal(null);
+    const paths = [...fileSel.ids];
+    if (!selectedProject || !selectedCkpt || !paths.length) return;
+    const r = await api.post(
+      `${apiBase(selectedProject)}/checkpoints/${encodeURIComponent(selectedCkpt)}/bulk-restore-files`,
+      { paths },
+    );
+    if (r?.ok) toast(`restored ${r.restored?.length || 0} file(s)`, 'ok');
+    else toast((r?.errors?.[0]?.error) || r?.error || 'bulk restore failed', 'err');
+  }, [selectedProject, selectedCkpt, fileSel]);
+
   const doUndo = useCallback(async (projectId) => {
     setModal(null);
     const pid = projectId || selectedProject;
@@ -1225,6 +1482,21 @@ function App() {
       <button class="danger solid" onClick=${() => doDelete(c)}>Delete</button>
     `,
   });
+
+  const openBulkDelete = () => {
+    const n = ckptSel.ids.size;
+    setModal({
+      title: `Delete ${n} checkpoints`,
+      body: html`
+        <p>Remove <strong>${n}</strong> selected checkpoint${n === 1 ? '' : 's'}?</p>
+        <p class="muted">Working tree unchanged. The snapshots are gone for good.</p>
+      `,
+      actions: html`
+        <button onClick=${() => setModal(null)}>Cancel</button>
+        <button class="danger solid" onClick=${doBulkDelete}>Delete ${n}</button>
+      `,
+    });
+  };
 
   const openPrune = () => {
     let val = 20;
@@ -1416,9 +1688,18 @@ function App() {
   const visibleProjects = searchFilter
     ? projects.filter(p => searchFilter.isProjectVisible(p.id))
     : projects;
-  const visibleCheckpoints = (searchFilter && selectedProject)
-    ? checkpoints.filter(c => searchFilter.isCheckpointVisible(selectedProject, c.id))
-    : checkpoints;
+  // Three filters compose on Checkpoints: search query, per-source toggle,
+  // favorites-only. All apply independently; row must pass every one.
+  const hiddenSources = new Set((settings.hiddenSources || []).map(s => s.toLowerCase()));
+  const favoritesOnly = !!settings.favoritesOnly;
+  const visibleCheckpoints = checkpoints.filter(c => {
+    const src = (c.source || 'claude').toLowerCase();
+    if (hiddenSources.has(src)) return false;
+    if (favoritesOnly && !c.starred) return false;
+    if (searchFilter && selectedProject &&
+        !searchFilter.isCheckpointVisible(selectedProject, c.id)) return false;
+    return true;
+  });
   const visibleFiles = (searchFilter && selectedProject && selectedCkpt)
     ? files.filter(f => searchFilter.isFileVisible(selectedProject, selectedCkpt, f.path))
     : files;
@@ -1431,6 +1712,27 @@ function App() {
   const countLabel = (visible, total) =>
     searchFilter ? html`<span class="count">(${visible} / ${total})</span>`
                  : html`<span class="count">(${total})</span>`;
+
+  // Column click handlers — plain click also navigates, cmd/shift only
+  // touches the multi-selection state. orderedIds is the column's currently
+  // visible row order so shift-range walks what the user sees.
+  const onProjectRowClick = useCallback((id, e) => {
+    const orderedIds = visibleProjects.filter(p => p.exists).map(p => p.id);
+    setProjSel(prev => selectionFromClick(prev, id, orderedIds, e));
+    if (!isMultiClick(e)) setSelectedProject(id);
+  }, [visibleProjects]);
+
+  const onCheckpointRowClick = useCallback((id, e) => {
+    const orderedIds = visibleCheckpoints.map(c => c.id);
+    setCkptSel(prev => selectionFromClick(prev, id, orderedIds, e));
+    if (!isMultiClick(e)) selectCheckpoint(id);
+  }, [visibleCheckpoints, selectCheckpoint]);
+
+  const onFileRowClick = useCallback((path, e) => {
+    const orderedIds = visibleFiles.map(f => f.path);
+    setFileSel(prev => selectionFromClick(prev, path, orderedIds, e));
+    if (!isMultiClick(e) && selectedCkpt) selectFile(selectedCkpt, path);
+  }, [visibleFiles, selectedCkpt, selectFile]);
 
   return html`
     <div class="app">
@@ -1468,33 +1770,60 @@ function App() {
           <div class="col-header">Projects ${countLabel(
             visibleProjects.filter(p => p.exists).length, existingProjects.length
           )}</div>
+          <${BulkActionBar}
+            count=${projSel.ids.size}
+            label=${projSel.ids.size === 1 ? 'project' : 'projects'}
+            onClear=${() => setProjSel(EMPTY_SELECTION)}
+            actions=${null}
+          />
           <div class="col-body">
             <${ProjectList}
               projects=${visibleProjects}
               selectedId=${selectedProject}
               openMenuId=${openMenuId}
-              onSelect=${setSelectedProject}
+              onSelect=${onProjectRowClick}
               onOpenMenu=${setOpenMenuId}
               onCloseMenu=${() => setOpenMenuId(null)}
               onPruneProject=${openPruneProject}
               onUndoProject=${openUndoProject}
               onCleanProject=${openCleanProject}
               highlight=${highlight}
+              multiIds=${projSel.ids}
             />
           </div>
         </div>
         <div class="col">
-          <div class="col-header">Checkpoints ${countLabel(visibleCheckpoints.length, checkpoints.length)}</div>
+          <div class="col-header">
+            <span>Checkpoints ${countLabel(visibleCheckpoints.length, checkpoints.length)}</span>
+            <${SourceFilterButton}
+              checkpoints=${checkpoints}
+              hiddenSources=${settings.hiddenSources}
+              setHidden=${(arr) => updateSettings({ hiddenSources: arr })}
+              favoritesOnly=${!!settings.favoritesOnly}
+              setFavoritesOnly=${(v) => updateSettings({ favoritesOnly: v })}/>
+          </div>
+          <${BulkActionBar}
+            count=${ckptSel.ids.size}
+            label=${ckptSel.ids.size === 1 ? 'checkpoint' : 'checkpoints'}
+            onClear=${() => setCkptSel(EMPTY_SELECTION)}
+            actions=${[
+              { label: 'Favorite',   icon: 'star',         onClick: () => doBulkStar(true) },
+              { label: 'Unfavorite', icon: 'star_outline', onClick: () => doBulkStar(false) },
+              { label: 'Delete',     icon: 'delete',       onClick: openBulkDelete, danger: true },
+            ]}
+          />
           <div class="col-body">
             <${CheckpointList}
               checkpoints=${visibleCheckpoints}
               selectedId=${selectedCkpt}
               newIds=${newIds}
-              onSelect=${selectCheckpoint}
+              onSelect=${onCheckpointRowClick}
               onRestore=${openRestore}
               onDelete=${openDelete}
               onPruneHere=${openPruneHere}
+              onStar=${doStar}
               highlight=${highlight}
+              multiIds=${ckptSel.ids}
             />
           </div>
         </div>
@@ -1508,9 +1837,19 @@ function App() {
               selectedFile=${selectedFile}
               ckptId=${selectedCkpt}
               ckpt=${selCkpt}
-              onSelect=${(p) => selectFile(selectedCkpt, p)}
+              onSelect=${onFileRowClick}
               onRestoreFile=${openRestoreFile}
               highlight=${highlight}
+              multiPaths=${fileSel.ids}
+              bulkBar=${html`
+                <${BulkActionBar}
+                  count=${fileSel.ids.size}
+                  label=${fileSel.ids.size === 1 ? 'file' : 'files'}
+                  onClear=${() => setFileSel(EMPTY_SELECTION)}
+                  actions=${[
+                    { label: `Restore ${fileSel.ids.size}`, icon: 'restore', onClick: doBulkRestoreFiles },
+                  ]}/>
+              `}
             />
             <${DiffViewer} path=${selectedFile} text=${diff}/>
           </div>

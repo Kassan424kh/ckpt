@@ -151,10 +151,16 @@ CREATE TABLE IF NOT EXISTS checkpoints (
     created_at    INTEGER,
     files_changed INTEGER,
     insertions    INTEGER,
-    deletions     INTEGER
+    deletions     INTEGER,
+    source        TEXT,
+    starred       INTEGER DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_prompts_session_time ON prompts(session_id, submitted_at DESC);
 """
+
+# Known agent sources. The UI color-codes these; unknown values render with a
+# neutral indicator and the literal source text in a tooltip.
+KNOWN_SOURCES = ("claude", "codex")
 
 
 def project_db_connect(root, create=True):
@@ -164,11 +170,15 @@ def project_db_connect(root, create=True):
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(path))
     conn.executescript(PROJECT_SCHEMA)
-    # Migrate older schemas missing the stats columns.
+    # Migrate older schemas: add columns added after release.
     cols = {r[1] for r in conn.execute("PRAGMA table_info(checkpoints)").fetchall()}
-    for col in ("files_changed", "insertions", "deletions"):
+    for col, decl in (("files_changed", "INTEGER"),
+                      ("insertions",    "INTEGER"),
+                      ("deletions",     "INTEGER"),
+                      ("source",        "TEXT"),
+                      ("starred",       "INTEGER DEFAULT 0")):
         if col not in cols:
-            conn.execute(f"ALTER TABLE checkpoints ADD COLUMN {col} INTEGER")
+            conn.execute(f"ALTER TABLE checkpoints ADD COLUMN {col} {decl}")
     conn.commit()
     return conn
 
@@ -382,23 +392,30 @@ def compute_shortstat(root, ref):
 
 
 def list_checkpoints(root):
-    """Return list of {id, ref, when, iso, message, stats}. Newest first.
+    """Return list of {id, ref, when, iso, message, stats, source}. Newest first.
     Caches stats in the project's SQLite db on first compute."""
     out, _, _ = git(
         "for-each-ref", f"{REF_NS}/", "--sort=-refname",
         "--format=%(refname)\x1f%(refname:short)\x1f%(authordate:relative)\x1f%(authordate:iso)\x1f%(contents:subject)",
         cwd=root,
     )
-    # Stats cache from db
+    # Per-row metadata cached in SQLite: stats, source tag, starred flag.
+    # Pre-existing rows missing these fields render with default styling.
     stats_cache = {}
+    source_by_id = {}
+    starred_ids = set()
     conn = project_db_connect(root, create=False)
     if conn:
         try:
-            for cid, f, i, d in conn.execute(
-                "SELECT id, files_changed, insertions, deletions FROM checkpoints "
-                "WHERE files_changed IS NOT NULL"
+            for cid, f, i, d, src, st in conn.execute(
+                "SELECT id, files_changed, insertions, deletions, source, starred FROM checkpoints"
             ).fetchall():
-                stats_cache[cid] = {"files": f or 0, "insertions": i or 0, "deletions": d or 0}
+                if f is not None:
+                    stats_cache[cid] = {"files": f or 0, "insertions": i or 0, "deletions": d or 0}
+                if src:
+                    source_by_id[cid] = src
+                if st:
+                    starred_ids.add(cid)
         except Exception:
             pass
 
@@ -416,7 +433,9 @@ def list_checkpoints(root):
             files, ins, dels = compute_shortstat(root, ref)
             stats = {"files": files, "insertions": ins, "deletions": dels}
             to_persist.append((cid, files, ins, dels))
-        rows.append({"id": cid, "ref": ref, "when": when, "iso": iso, "message": msg, "stats": stats})
+        rows.append({"id": cid, "ref": ref, "when": when, "iso": iso, "message": msg,
+                     "stats": stats, "source": source_by_id.get(cid),
+                     "starred": cid in starred_ids})
 
     if conn and to_persist:
         try:
@@ -548,6 +567,63 @@ def op_prune(root, n):
         git("update-ref", "-d", r, cwd=root)
     cleanup_orphan_rows(root)
     return {"ok": True, "deleted": len(victims)}
+
+
+def op_set_starred(root, ckpt_ids, starred):
+    """Set the starred flag on one or more checkpoints. Creates rows for
+    ids that don't yet have a DB entry (could happen if the checkpoint was
+    made before the column existed and never re-read)."""
+    if not ckpt_ids:
+        return {"ok": True, "updated": 0}
+    val = 1 if starred else 0
+    conn = project_db_connect(root)
+    try:
+        # Make sure a row exists for each id so the UPDATE has something to
+        # hit. INSERT OR IGNORE keeps existing rows intact.
+        conn.executemany(
+            "INSERT OR IGNORE INTO checkpoints(id) VALUES (?)",
+            [(cid,) for cid in ckpt_ids],
+        )
+        placeholders = ",".join("?" * len(ckpt_ids))
+        conn.execute(
+            f"UPDATE checkpoints SET starred = ? WHERE id IN ({placeholders})",
+            (val, *ckpt_ids),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return {"ok": True, "updated": len(ckpt_ids), "starred": bool(starred)}
+
+
+def op_bulk_delete(root, ckpt_ids):
+    """Delete multiple checkpoints. Returns count of refs actually removed
+    (skips ids that no longer have a ref)."""
+    deleted = 0
+    errors = []
+    for cid in ckpt_ids:
+        r = op_delete(root, f"{REF_NS}/{cid}")
+        if r.get("ok"):
+            deleted += 1
+        elif r.get("error"):
+            errors.append(f"{cid}: {r['error']}")
+    cleanup_orphan_rows(root)
+    return {"ok": True, "deleted": deleted, "errors": errors}
+
+
+def op_bulk_restore_files(root, ref, paths):
+    """Run op_restore_file across many paths in one call. Stops at the
+    first hard error; partial successes are reported."""
+    restored = []
+    errors = []
+    for p in paths:
+        if not p:
+            continue
+        r = op_restore_file(root, ref, p)
+        if r.get("ok"):
+            restored.append(p)
+        else:
+            errors.append({"path": p, "error": r.get("error") or "restore failed"})
+    return {"ok": not errors, "restored": restored, "errors": errors}
 
 
 def op_clean(root):
@@ -852,7 +928,19 @@ def cleanup_orphan_rows(root):
 
 # ---------------- hooks ----------------
 
-def hook_save_prompt():
+def _normalize_source(value):
+    """Map a free-text source to one of KNOWN_SOURCES, falling back to the
+    literal lower-cased value (truncated to 32 chars) so unknown agents
+    still get a stable tag — the UI just renders them with a neutral dot."""
+    s = (value or "").strip().lower()
+    if not s:
+        return "claude"
+    if s in KNOWN_SOURCES:
+        return s
+    return s[:32]
+
+
+def hook_save_prompt(source="claude"):
     """UserPromptSubmit hook: persist the full prompt into the project's db,
     and register the project in the per-machine projects index."""
     try:
@@ -862,6 +950,11 @@ def hook_save_prompt():
     sid = (data.get("session_id") or "").strip()
     prompt = (data.get("prompt") or "").strip()
     cwd = data.get("cwd") or claude_project_dir()
+    # Prompts are tagged solely by the caller's --source flag (Codex and
+    # Claude don't put a source field in the payload). The DB schema for
+    # prompts doesn't currently carry source — it's only used to fetch the
+    # latest prompt for the active session, and the checkpoint row itself
+    # carries the source — so we just persist as-is.
     if not sid or not prompt:
         return
     if not is_git_repo(cwd):
@@ -884,7 +977,7 @@ def hook_save_prompt():
         conn.close()
 
 
-def hook_checkpoint():
+def hook_checkpoint(source="claude"):
     """Stop hook: snapshot the working tree and record the checkpoint."""
     try:
         data = json.load(sys.stdin)
@@ -896,6 +989,7 @@ def hook_checkpoint():
         return
     root = project_root(cwd)
     register_project(root)
+    source = _normalize_source(source)
 
     # Fetch the latest prompt for this session, if any.
     prompt = None
@@ -981,9 +1075,9 @@ def hook_checkpoint():
     try:
         conn.execute(
             "INSERT OR REPLACE INTO checkpoints"
-            "(id, session_id, prompt, created_at, files_changed, insertions, deletions) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (ckpt_id, sid or None, prompt, int(time.time()), files, ins, dels),
+            "(id, session_id, prompt, created_at, files_changed, insertions, deletions, source) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (ckpt_id, sid or None, prompt, int(time.time()), files, ins, dels, source),
         )
         conn.commit()
     finally:
@@ -1614,6 +1708,38 @@ class UIHandler(http.server.BaseHTTPRequestHandler):
                 ref = f"{REF_NS}/{m.group(2)}"
                 self._send_json(op_delete(root, ref)); return
 
+            m = re.match(r"^/api/projects/([^/]+)/checkpoints/([^/]+)/star$", p)
+            if m:
+                root = self._project_root_for(m.group(1))
+                if not root: return self._send_json({"ok": False, "error": "project not found"}, status=404)
+                data = self._read_json()
+                self._send_json(op_set_starred(root, [m.group(2)], bool(data.get("starred", True)))); return
+
+            m = re.match(r"^/api/projects/([^/]+)/checkpoints/bulk-star$", p)
+            if m:
+                root = self._project_root_for(m.group(1))
+                if not root: return self._send_json({"ok": False, "error": "project not found"}, status=404)
+                data = self._read_json()
+                ids = [str(i) for i in (data.get("ids") or []) if i]
+                self._send_json(op_set_starred(root, ids, bool(data.get("starred", True)))); return
+
+            m = re.match(r"^/api/projects/([^/]+)/checkpoints/bulk-delete$", p)
+            if m:
+                root = self._project_root_for(m.group(1))
+                if not root: return self._send_json({"ok": False, "error": "project not found"}, status=404)
+                data = self._read_json()
+                ids = [str(i) for i in (data.get("ids") or []) if i]
+                self._send_json(op_bulk_delete(root, ids)); return
+
+            m = re.match(r"^/api/projects/([^/]+)/checkpoints/([^/]+)/bulk-restore-files$", p)
+            if m:
+                root = self._project_root_for(m.group(1))
+                if not root: return self._send_json({"ok": False, "error": "project not found"}, status=404)
+                ref = f"{REF_NS}/{m.group(2)}"
+                data = self._read_json()
+                paths = [str(p_) for p_ in (data.get("paths") or []) if p_]
+                self._send_json(op_bulk_restore_files(root, ref, paths)); return
+
             m = re.match(r"^/api/projects/([^/]+)/prune$", p)
             if m:
                 root = self._project_root_for(m.group(1))
@@ -2029,9 +2155,11 @@ def cmd_mcp(_args):
 # ---------------- main dispatch ----------------
 
 def main():
-    parser = argparse.ArgumentParser(prog="ckpt", description="Per-turn git-ref checkpoints for Claude Code.")
+    parser = argparse.ArgumentParser(prog="ckpt", description="Per-turn git-ref checkpoints for Claude Code and Codex CLI.")
     parser.add_argument("--hook", choices=["save-prompt", "checkpoint"],
                         help=argparse.SUPPRESS)
+    parser.add_argument("--source", default="claude",
+                        help=argparse.SUPPRESS)  # caller tag: claude | codex | <other>
     sub = parser.add_subparsers(dest="cmd")
 
     sub.add_parser("list", help="List checkpoints").set_defaults(func=lambda a: cmd_list())
@@ -2068,9 +2196,9 @@ def main():
     args = parser.parse_args()
 
     if args.hook == "save-prompt":
-        hook_save_prompt(); return
+        hook_save_prompt(source=args.source); return
     if args.hook == "checkpoint":
-        hook_checkpoint(); return
+        hook_checkpoint(source=args.source); return
 
     if not args.cmd:
         parser.print_help()
