@@ -7,6 +7,7 @@
  *   - Inter as preferred body font, system-ui fallback
  */
 :root {
+  color-scheme: dark;
   /* Surface */
   --bg:       #1a1a1a;
   --panel:    #1f1f1f;
@@ -45,6 +46,136 @@
 
   /* Layout */
   --radius: 6px;
+}
+
+/* ---- Claude Light: warm cream surfaces, same terra-cotta accent.
+ *  All tokens that drive the dark theme are restated here; CSS will fall
+ *  back to :root for anything we miss. Status/diff colors get darker
+ *  tones so they stay legible against the cream background. */
+[data-theme="claude-light"] {
+  color-scheme: light;
+  --bg:       #faf8f4;
+  --panel:    #ffffff;
+  --panel2:   #f3efe7;
+  --panel3:   #ebe5d9;
+  --border:   #d8d1c2;
+  --border2:  #e7e1d4;
+
+  --text:        #2c2826;
+  --text-soft:   #3a3331;     /* darker so syntax tokens stand out on cream */
+  --muted:       #66605b;     /* darker than before — comments are readable */
+  --muted-soft:  #8a8278;
+
+  --accent:        #B85A3C;
+  --accent-light:  #8a3d24;
+  --accent-dim:    #e9c6b3;
+  --accent-bg:     rgba(184, 90, 60, 0.10);
+
+  --ok:    #1a6b28;
+  --warn:  #b53024;
+  --warn2: #80201a;
+  --info:  #195e8f;
+  --amber: #7a5610;
+
+  /* Diff backgrounds: GitHub-style very pale solids instead of translucent
+   * tints. A 15%-alpha green over cream washed out the blue/orange syntax
+   * tokens we ride on top of it. */
+  --add-bg:    #e7f3e0;
+  --add-text:  #1a6b28;
+  --del-bg:    #fbe6e1;
+  --del-text:  #80201a;
+  --hunk-bg:   #f3eddb;
+  --hunk-text: #7a5610;
+  --new-bg:    rgba(184, 90, 60, 0.18);
+
+  /* Search highlight: yellow reads better than pale blue on cream. */
+  --mark-bg:        rgba(232, 184, 96, 0.45);
+  --mark-bg-strong: rgba(232, 184, 96, 0.65);
+
+  /* Diff comments: --muted is dark enough to read on pale add/del bg. */
+  --diff-add-comment: var(--muted);
+  --diff-del-comment: var(--muted);
+}
+
+/* ---- GitHub Dark: gh's "Dark default" palette. Blue accent replaces
+ *  the terra-cotta so the whole product feels like a GitHub surface. */
+[data-theme="github-dark"] {
+  color-scheme: dark;
+  --bg:       #0d1117;
+  --panel:    #161b22;
+  --panel2:   #1c2128;
+  --panel3:   #21262d;
+  --border:   #30363d;
+  --border2:  #21262d;
+
+  --text:        #c9d1d9;
+  --text-soft:   #b1bac4;
+  --muted:       #8b949e;
+  --muted-soft:  #6e7681;
+
+  --accent:        #58a6ff;
+  --accent-light:  #79c0ff;
+  --accent-dim:    #1f6feb;
+  --accent-bg:     rgba(56, 139, 253, 0.15);
+
+  --ok:    #3fb950;
+  --warn:  #f85149;
+  --warn2: #da3633;
+  --info:  #58a6ff;
+  --amber: #d29922;
+
+  --add-bg:    rgba(46, 160, 67, 0.15);
+  --add-text:  #56d364;
+  --del-bg:    rgba(248, 81, 73, 0.15);
+  --del-text:  #ff7b72;
+  --hunk-bg:   rgba(210, 153, 34, 0.10);
+  --hunk-text: #d29922;
+  --new-bg:    rgba(56, 139, 253, 0.20);
+}
+
+/* ---- GitHub Light: gh's "Light default" palette. */
+[data-theme="github-light"] {
+  color-scheme: light;
+  --bg:       #ffffff;
+  --panel:    #f6f8fa;
+  --panel2:   #eaeef2;
+  --panel3:   #d0d7de;
+  --border:   #d0d7de;
+  --border2:  #e6edf3;
+
+  --text:        #1f2328;
+  --text-soft:   #424a53;
+  --muted:       #59636e;     /* darker than gh's #656d76 — keeps comments readable on add/del bg */
+  --muted-soft:  #8c959f;
+
+  --accent:        #0969da;
+  --accent-light:  #0550ae;
+  --accent-dim:    #b6e3ff;
+  --accent-bg:     rgba(9, 105, 218, 0.10);
+
+  --ok:    #116329;           /* darker green so add-line tokens are legible */
+  --warn:  #82071e;
+  --warn2: #a40e26;
+  --info:  #0550ae;           /* deeper blue for number/symbol tokens */
+  --amber: #7d4e00;
+
+  /* GitHub's actual diff colors — opaque pale tints. The previous 15%-alpha
+   * versions washed out the blue keywords sitting on top. */
+  --add-bg:    #dafbe1;
+  --add-text:  #116329;
+  --del-bg:    #ffebe9;
+  --del-text:  #82071e;
+  --hunk-bg:   #ddf4ff;
+  --hunk-text: #0550ae;
+  --new-bg:    rgba(9, 105, 218, 0.15);
+
+  /* Search highlight: GitHub-style yellow. */
+  --mark-bg:        #fff8c5;
+  --mark-bg-strong: #fae17d;
+
+  /* Diff comments: --muted is dark enough to read on pale add/del bg. */
+  --diff-add-comment: var(--muted);
+  --diff-del-comment: var(--muted);
 }
 
 * { box-sizing: border-box; }
@@ -244,11 +375,11 @@ header .live.offline::before { content: "○ "; color: var(--warn); }
 .search-meta.zero { color: var(--warn); background: rgba(240, 128, 128, 0.10); }
 .search-meta.err  { color: var(--warn); background: rgba(240, 128, 128, 0.10); }
 
-/* Highlighted search matches inside column rows + the prompt pane. Blue
- * (--info) sits clearly outside the terra-cotta selection palette, so a
- * highlighted match in a selected row is still readable. */
+/* Highlighted search matches inside column rows + the prompt pane. Backed
+ * by a CSS var so light themes can swap in a more saturated yellow — a
+ * 28%-alpha blue is invisible on a white panel. */
 mark {
-  background: rgba(122, 192, 224, 0.28);
+  background: var(--mark-bg, rgba(122, 192, 224, 0.28));
   color: var(--text);
   border-radius: 2px;
   padding: 0 1px;
@@ -258,7 +389,7 @@ mark {
 .checkpoint.selected mark,
 .project.selected mark,
 .file.selected mark {
-  background: rgba(122, 192, 224, 0.40);
+  background: var(--mark-bg-strong, rgba(122, 192, 224, 0.40));
 }
 .search-filter-row {
   display: flex;
@@ -327,7 +458,7 @@ mark {
   padding: 3px 6px;
   font: inherit;
   font-size: 11px;
-  color-scheme: dark;
+  /* color-scheme inherits from :root or [data-theme=...] now */
 }
 .search-date:focus { outline: none; border-color: var(--accent); }
 .search-link {
@@ -560,8 +691,10 @@ button.danger.solid:hover:not(:disabled) { background: var(--warn); border-color
   border-left: 3px solid var(--muted-soft);
   padding-left: 11px;       /* 14 - 3, keeps text alignment with other cols */
 }
-.checkpoint.source-claude { border-left-color: var(--accent); }
-.checkpoint.source-codex  { border-left-color: var(--info); }
+/* Source colors stay fixed across themes so the agent indicator never
+ * gets washed away by an accent that happens to be blue too (GitHub). */
+.checkpoint.source-claude { border-left-color: #CC785C; }
+.checkpoint.source-codex  { border-left-color: #7ac0e0; }
 .checkpoint.selected {
   background: var(--accent-bg);
 }
@@ -640,8 +773,8 @@ button.danger.solid:hover:not(:disabled) { background: var(--warn); border-color
   background: var(--muted-soft);
   flex-shrink: 0;
 }
-.source-filter-row.source-claude .source-swatch { background: var(--accent); }
-.source-filter-row.source-codex  .source-swatch { background: var(--info); }
+.source-filter-row.source-claude .source-swatch { background: #CC785C; }
+.source-filter-row.source-codex  .source-swatch { background: #7ac0e0; }
 .source-filter-row .source-name { flex: 1; }
 .source-filter-actions {
   display: flex;
@@ -1059,11 +1192,14 @@ button.danger.solid:hover:not(:disabled) { background: var(--warn); border-color
 .hljs-strong           { font-weight: 600; }
 .hljs-link             { color: var(--info); text-decoration: underline; }
 
-/* In add/del lines, tone down the syntax colors so the line color reads first. */
+/* In add/del lines, the dark theme's flourish was a green/red-tinged
+ * comment color — invisible on top of a light theme's pale diff bg.
+ * Use a var so dark themes keep the tint and light themes fall back
+ * to the themed --muted. */
 .diff-line.add .hljs-comment,
-.diff-line.add .hljs-quote { color: rgba(166, 227, 161, 0.6); }
+.diff-line.add .hljs-quote { color: var(--diff-add-comment, rgba(166, 227, 161, 0.6)); }
 .diff-line.del .hljs-comment,
-.diff-line.del .hljs-quote { color: rgba(255, 157, 160, 0.6); }
+.diff-line.del .hljs-quote { color: var(--diff-del-comment, rgba(255, 157, 160, 0.6)); }
 
 /* ---- empty / toast / modal ---- */
 .empty {
@@ -1162,9 +1298,9 @@ button.danger.solid:hover:not(:disabled) { background: var(--warn); border-color
 
 /* ---- update banner ---- */
 .update-banner {
-  background: rgba(204, 120, 92, 0.10);
+  background: var(--accent-bg);
   border-bottom: 1px solid var(--border);
-  border-top: 1px solid rgba(204, 120, 92, 0.25);
+  border-top: 1px solid var(--accent-dim);
   padding: 10px 18px 12px;
 }
 .update-banner-row {
@@ -1237,6 +1373,47 @@ button.danger.solid:hover:not(:disabled) { background: var(--warn); border-color
 @keyframes spin {
   from { transform: rotate(0deg); }
   to   { transform: rotate(360deg); }
+}
+
+/* ---- theme picker ---- */
+.theme-picker {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+}
+.theme-option {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  cursor: pointer;
+  user-select: none;
+  background: var(--panel2);
+  transition: border-color 0.12s, background 0.12s;
+}
+.theme-option:hover { border-color: var(--accent-dim); }
+.theme-option.active {
+  border-color: var(--accent);
+  background: var(--accent-bg);
+}
+.theme-option input { display: none; }
+.theme-swatch {
+  display: inline-flex;
+  flex-shrink: 0;
+  border-radius: 4px;
+  overflow: hidden;
+  border: 1px solid var(--border);
+}
+.theme-swatch > span {
+  width: 12px;
+  height: 24px;
+  display: block;
+}
+.theme-label {
+  font-size: 12px;
+  color: var(--text);
 }
 
 /* ---- settings modal ---- */

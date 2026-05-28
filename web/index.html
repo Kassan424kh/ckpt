@@ -3,6 +3,21 @@
 <head>
   <meta charset="utf-8">
   <title>ckpt — Claude checkpoints</title>
+  <!-- Bootstrap the saved theme synchronously, before any stylesheet
+       evaluates, so a reload doesn't flash the default dark theme on top of
+       a user who chose a light one. Mirrors the THEMES list in app.js;
+       keep them in sync if you add another theme. -->
+  <script>
+    (function () {
+      try {
+        var s = JSON.parse(localStorage.getItem('ckpt.settings') || '{}');
+        var ok = ['claude-light', 'github-dark', 'github-light'];
+        if (s && ok.indexOf(s.theme) >= 0) {
+          document.documentElement.setAttribute('data-theme', s.theme);
+        }
+      } catch (e) {}
+    })();
+  </script>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link rel="stylesheet"

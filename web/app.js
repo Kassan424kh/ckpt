@@ -364,17 +364,43 @@ function SearchBar({
 // ---------- settings ----------
 
 const SETTINGS_KEY = 'ckpt.settings';
+
+// Theme descriptors used by both the picker UI and the runtime apply step.
+// Keep `id` stable — it's what gets persisted into ckpt.settings.theme and
+// written to document.documentElement.dataset.theme. The `:root` block in
+// styles.css is treated as 'claude-dark' (no data-theme attribute set).
+const THEMES = [
+  { id: 'claude-dark',  label: 'Claude Dark',  swatch: ['#1a1a1a', '#262626', '#CC785C'] },
+  { id: 'claude-light', label: 'Claude Light', swatch: ['#faf8f4', '#f3efe7', '#B85A3C'] },
+  { id: 'github-dark',  label: 'GitHub Dark',  swatch: ['#0d1117', '#21262d', '#58a6ff'] },
+  { id: 'github-light', label: 'GitHub Light', swatch: ['#ffffff', '#eaeef2', '#0969da'] },
+];
+const DEFAULT_THEME = 'claude-dark';
+
+function applyTheme(themeId) {
+  // Default theme = no attribute, so the :root rules take over verbatim.
+  if (themeId === DEFAULT_THEME) document.documentElement.removeAttribute('data-theme');
+  else document.documentElement.setAttribute('data-theme', themeId);
+}
+
 function loadSettings() {
-  const defaults = { deleteLater: false, autoUpdate: false, hiddenSources: [], favoritesOnly: false };
+  const defaults = { deleteLater: false, autoUpdate: false, hiddenSources: [], favoritesOnly: false, theme: DEFAULT_THEME };
   try {
     const s = JSON.parse(localStorage.getItem(SETTINGS_KEY) || '{}');
+    const theme = THEMES.find(t => t.id === s.theme) ? s.theme : defaults.theme;
     return {
       ...defaults, ...s,
       hiddenSources: Array.isArray(s.hiddenSources) ? s.hiddenSources : defaults.hiddenSources,
       favoritesOnly: !!s.favoritesOnly,
+      theme,
     };
   } catch { return defaults; }
 }
+
+// Apply at module-load time so the document starts in the user's chosen
+// theme — without this we'd get a brief flash of the default dark theme
+// before the App effect runs.
+applyTheme(loadSettings().theme);
 function saveSettings(s) {
   try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(s)); } catch {}
 }
@@ -385,6 +411,25 @@ function SettingsModal({ settings, updateSettings, hasUndo, onClose, onPrune, on
       title="Settings"
       onClose=${onClose}
       actions=${html`<button class="primary" onClick=${onClose}>Close</button>`}>
+      <div class="settings-section">
+        <div class="settings-section-title">Theme</div>
+        <div class="theme-picker">
+          ${THEMES.map(t => html`
+            <label key=${t.id}
+                   class=${classes('theme-option', settings.theme === t.id && 'active')}>
+              <input type="radio" name="ckpt-theme"
+                     checked=${settings.theme === t.id}
+                     onChange=${() => updateSettings({ theme: t.id })}/>
+              <span class="theme-swatch">
+                <span style=${`background:${t.swatch[0]}`}></span>
+                <span style=${`background:${t.swatch[1]}`}></span>
+                <span style=${`background:${t.swatch[2]}`}></span>
+              </span>
+              <span class="theme-label">${t.label}</span>
+            </label>
+          `)}
+        </div>
+      </div>
       <div class="settings-section">
         <div class="settings-section-title">Restore behavior</div>
         <label class="settings-toggle">
@@ -973,6 +1018,10 @@ function App() {
 
   // settings (persisted to localStorage)
   const [settings, setSettingsState] = useState(loadSettings);
+  // Sync the chosen theme to <html data-theme="..."> any time it changes.
+  // Mount-time apply is implicit because `settings` is initialized from
+  // localStorage and this effect runs after the first render.
+  useEffect(() => { applyTheme(settings.theme); }, [settings.theme]);
   const [showSettings, setShowSettings] = useState(false);
 
   // self-update
