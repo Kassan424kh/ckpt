@@ -942,7 +942,15 @@ def _normalize_source(value):
 
 def hook_save_prompt(source="claude"):
     """UserPromptSubmit hook: persist the full prompt into the project's db,
-    and register the project in the per-machine projects index."""
+    and register the project in the per-machine projects index.
+
+    Also catches the cancelled-turn case: if the user interrupts an
+    assistant response (no Stop hook fires), the next UserPromptSubmit is
+    our only chance to checkpoint the work-in-progress before it gets
+    overwritten by the new turn. We snapshot here against the *previous*
+    prompt's text — dedupe inside _create_checkpoint makes it a no-op when
+    nothing actually changed since the last checkpoint.
+    """
     try:
         data = json.load(sys.stdin)
     except Exception:
@@ -950,17 +958,22 @@ def hook_save_prompt(source="claude"):
     sid = (data.get("session_id") or "").strip()
     prompt = (data.get("prompt") or "").strip()
     cwd = data.get("cwd") or claude_project_dir()
-    # Prompts are tagged solely by the caller's --source flag (Codex and
-    # Claude don't put a source field in the payload). The DB schema for
-    # prompts doesn't currently carry source — it's only used to fetch the
-    # latest prompt for the active session, and the checkpoint row itself
-    # carries the source — so we just persist as-is.
     if not sid or not prompt:
         return
     if not is_git_repo(cwd):
         return
     root = project_root(cwd)
     register_project(root)
+
+    # 1. Catch up: snapshot whatever's in the tree against the previous
+    #    prompt's text. If the previous turn completed normally the tree
+    #    already matches its checkpoint and this is a no-op; if the turn
+    #    was cancelled we save the work that would otherwise be lost.
+    prev_prompt = _latest_prompt_for_session(root, sid)
+    if prev_prompt:
+        _create_checkpoint(root, sid, source, prev_prompt)
+
+    # 2. Save the new prompt.
     conn = project_db_connect(root)
     try:
         conn.execute(
@@ -977,39 +990,17 @@ def hook_save_prompt(source="claude"):
         conn.close()
 
 
-def hook_checkpoint(source="claude"):
-    """Stop hook: snapshot the working tree and record the checkpoint."""
-    try:
-        data = json.load(sys.stdin)
-    except Exception:
-        data = {}
-    sid = (data.get("session_id") or "").strip()
-    cwd = data.get("cwd") or claude_project_dir()
-    if not is_git_repo(cwd):
-        return
-    root = project_root(cwd)
-    register_project(root)
+def _create_checkpoint(root, session_id, source, prompt_text):
+    """Snapshot the current working tree into a checkpoint ref + DB row.
+
+    Returns the new checkpoint id, or None if no snapshot was created (either
+    the tree matched the previous checkpoint / HEAD, or git refused to write).
+    Caller-shared between the Stop hook and the UserPromptSubmit catch-up
+    path so cancelled turns still get a checkpoint.
+    """
     source = _normalize_source(source)
+    msg = (prompt_text.splitlines()[0] if prompt_text and prompt_text.strip() else None) or "(turn)"
 
-    # Fetch the latest prompt for this session, if any.
-    prompt = None
-    if sid:
-        conn = project_db_connect(root, create=False)
-        if conn:
-            try:
-                row = conn.execute(
-                    "SELECT prompt FROM prompts WHERE session_id = ? "
-                    "ORDER BY submitted_at DESC LIMIT 1",
-                    (sid,),
-                ).fetchone()
-                prompt = row[0] if row else None
-                conn.close()
-            except Exception:
-                pass
-
-    msg = (prompt.splitlines()[0] if prompt and prompt.strip() else None) or "(turn)"
-
-    # Build the snapshot
     git_dir, _, _ = git("rev-parse", "--git-dir", cwd=root)
     git_dir = git_dir.strip()
     if not os.path.isabs(git_dir):
@@ -1027,10 +1018,10 @@ def hook_checkpoint(source="claude"):
         _strip_db_from_index(root, env)
         r = subprocess.run(["git", "write-tree"], env=env, capture_output=True, text=True, cwd=root)
         if r.returncode != 0:
-            return
+            return None
         tree = r.stdout.strip()
         if not tree:
-            return
+            return None
     finally:
         try:
             os.unlink(tmp.name)
@@ -1046,11 +1037,11 @@ def hook_checkpoint(source="claude"):
     if latest:
         lt = subprocess.run(["git", "rev-parse", f"{latest}^{{tree}}"], capture_output=True, text=True, cwd=root).stdout.strip()
         if tree == lt:
-            return
+            return None
     else:
         ht_r = subprocess.run(["git", "rev-parse", "HEAD^{tree}"], capture_output=True, text=True, cwd=root)
         if tree == ht_r.stdout.strip():
-            return
+            return None
 
     head, _, _ = git("rev-parse", "HEAD", cwd=root)
     head = head.strip()
@@ -1059,25 +1050,23 @@ def hook_checkpoint(source="claude"):
         cmd.extend(["-p", head])
     commit = subprocess.run(cmd, capture_output=True, text=True, cwd=root).stdout.strip()
     if not commit:
-        return
+        return None
 
     ckpt_id = time.strftime("%Y%m%d-%H%M%S")
     ref = f"{REF_NS}/{ckpt_id}"
     _, _, code = git("update-ref", ref, commit, cwd=root)
     if code != 0:
-        return
+        return None
 
-    # Compute shortstat
     files, ins, dels = compute_shortstat(root, ref)
 
-    # Store in project db
     conn = project_db_connect(root)
     try:
         conn.execute(
             "INSERT OR REPLACE INTO checkpoints"
             "(id, session_id, prompt, created_at, files_changed, insertions, deletions, source) "
             "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (ckpt_id, sid or None, prompt, int(time.time()), files, ins, dels, source),
+            (ckpt_id, session_id or None, prompt_text, int(time.time()), files, ins, dels, source),
         )
         conn.commit()
     finally:
@@ -1089,6 +1078,42 @@ def hook_checkpoint(source="claude"):
     for old in refs[100:]:
         git("update-ref", "-d", old, cwd=root)
     cleanup_orphan_rows(root)
+    return ckpt_id
+
+
+def _latest_prompt_for_session(root, session_id):
+    """Most recent prompt text for the given session, or None."""
+    if not session_id:
+        return None
+    conn = project_db_connect(root, create=False)
+    if not conn:
+        return None
+    try:
+        row = conn.execute(
+            "SELECT prompt FROM prompts WHERE session_id = ? "
+            "ORDER BY submitted_at DESC LIMIT 1",
+            (session_id,),
+        ).fetchone()
+        return row[0] if row else None
+    finally:
+        try: conn.close()
+        except Exception: pass
+
+
+def hook_checkpoint(source="claude"):
+    """Stop hook: snapshot the working tree and record the checkpoint."""
+    try:
+        data = json.load(sys.stdin)
+    except Exception:
+        data = {}
+    sid = (data.get("session_id") or "").strip()
+    cwd = data.get("cwd") or claude_project_dir()
+    if not is_git_repo(cwd):
+        return
+    root = project_root(cwd)
+    register_project(root)
+    prompt = _latest_prompt_for_session(root, sid)
+    _create_checkpoint(root, sid, source, prompt)
 
 
 # ---------------- CLI commands ----------------

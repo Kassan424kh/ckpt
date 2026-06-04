@@ -692,9 +692,26 @@ button.danger.solid:hover:not(:disabled) { background: var(--warn); border-color
   padding-left: 11px;       /* 14 - 3, keeps text alignment with other cols */
 }
 /* Source colors stay fixed across themes so the agent indicator never
- * gets washed away by an accent that happens to be blue too (GitHub). */
-.checkpoint.source-claude { border-left-color: #CC785C; }
-.checkpoint.source-codex  { border-left-color: #7ac0e0; }
+ * gets washed away by a theme accent that happens to clash. Hexes are
+ * pulled from the official brand SVGs: Anthropic's terra fill and the
+ * midpoint of OpenAI's purple-blue Codex gradient. */
+.checkpoint.source-claude { border-left-color: #D97757; }
+.checkpoint.source-codex  { border-left-color: #7A9DFF; }
+
+/* Per-source icon sits between the star and the #N badge. Known sources
+ * embed the official brand SVG (its own fills/gradients carry the color),
+ * unknown sources fall back to a Material Symbol dot tinted by `color`. */
+.checkpoint .source-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--muted-soft);
+  flex-shrink: 0;
+  width: 14px;
+  height: 14px;
+}
+.checkpoint .source-icon svg { width: 100%; height: 100%; display: block; }
+.checkpoint .source-icon .icon { font-size: 13px; vertical-align: -2px; }
 .checkpoint.selected {
   background: var(--accent-bg);
 }
@@ -773,8 +790,8 @@ button.danger.solid:hover:not(:disabled) { background: var(--warn); border-color
   background: var(--muted-soft);
   flex-shrink: 0;
 }
-.source-filter-row.source-claude .source-swatch { background: #CC785C; }
-.source-filter-row.source-codex  .source-swatch { background: #7ac0e0; }
+.source-filter-row.source-claude .source-swatch { background: #D97757; }
+.source-filter-row.source-codex  .source-swatch { background: #7A9DFF; }
 .source-filter-row .source-name { flex: 1; }
 .source-filter-actions {
   display: flex;
@@ -800,7 +817,7 @@ button.danger.solid:hover:not(:disabled) { background: var(--warn); border-color
   background: transparent;
   border: 0;
   padding: 0;
-  margin-right: 2px;
+  margin-left: 4px;          /* small gap after the timestamp id */
   color: var(--muted-soft);
   cursor: pointer;
   opacity: 0;
@@ -923,7 +940,7 @@ button.danger.solid:hover:not(:disabled) { background: var(--warn); border-color
 }
 .checkpoint .row1 {
   display: flex;
-  align-items: baseline;
+  align-items: center;
   gap: 6px;
   font-size: 10px;
   color: var(--muted);
