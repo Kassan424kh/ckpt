@@ -509,7 +509,7 @@ function ProjectList({
   multiIds,
 }) {
   if (!projects.length) {
-    return html`<div class="empty">no projects yet — run Claude in a git repo</div>`;
+    return html`<div class="empty">no projects yet — run Claude in any project folder</div>`;
   }
   const selected = multiIds || new Set();
   return html`

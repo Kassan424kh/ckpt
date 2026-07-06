@@ -21,11 +21,20 @@ Modes:
 
 Storage:
     Per-project:
-        <project>/.git/refs/claude-checkpoints           snapshot refs (immutable commits)
+        <project>/.git/refs/claude-checkpoints           snapshot refs (git repos)
     Per-machine:
         ~/.local/share/ckpt/projects.db                  index of known projects
         ~/.local/share/ckpt/projects/<id>/checkpoints.db prompts + checkpoint metadata
+        ~/.local/share/ckpt/projects/<id>/snapshots.git  shadow repo: snapshot refs
+                                                          for folders that aren't
+                                                          git-tracked yet
         ~/.local/share/ckpt/web/                         web UI assets (installed by install.sh)
+
+    A folder that isn't its own git repo still gets checkpoints from turn one:
+    snapshots go into the private `snapshots.git` shadow repo (a bare repo driven
+    with the folder as its work-tree), so nothing appears in the folder itself.
+    Once a shadow store exists it's used stickily — even after the user later runs
+    `git init` — so early checkpoints are never orphaned.
 """
 
 import argparse
@@ -64,21 +73,169 @@ UPDATE_CACHE_TTL = 300  # seconds
 
 
 # ---------------- git wrappers ----------------
+#
+# Checkpoints normally live in the project's own `.git/refs/claude-checkpoints`.
+# But a lot of work happens in a folder *before* `git init` is ever run — the
+# early vibe-coding phase — and those turns used to be lost entirely. For any
+# folder that isn't its own git repo we instead keep a private *bare* git repo
+# under the project's data dir and drive it with an explicit work-tree (the
+# classic "dotfiles bare repo" trick). Snapshots, refs, and restores all target
+# that shadow store, so the user's folder stays pristine — no `.git` ever
+# appears in it — yet checkpoints accrue from the very first turn.
+#
+# `_store_overlay(cwd)` returns the env overlay (GIT_DIR/GIT_WORK_TREE) that
+# routes every git call for that folder to the right object store. The `git()`
+# wrapper applies it transparently, so the ~50 existing `git(..., cwd=root)`
+# call sites need no changes. `is_git_repo`/`project_root` deliberately bypass
+# the overlay — they answer "is this folder its *own* real repo?", the ground
+# truth the overlay is derived from.
 
-def git(*args, cwd=None):
-    """Run git in a project dir and return (stdout, stderr, returncode)."""
-    r = subprocess.run(["git", *args], capture_output=True, text=True, cwd=cwd)
+# Git's canonical empty-tree hash: the diff base for a project's first
+# (parentless) checkpoint so its full contents show up as additions.
+EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+
+_STORE_ENV_CACHE = {}
+_STORE_LOCK = threading.Lock()
+
+
+def _raw_git(*args, cwd=None, env=None):
+    """git with no store routing — used by detection and shadow bootstrap.
+    With no explicit env it inherits a *hermetic* one (any shell-exported
+    GIT_DIR/GIT_WORK_TREE/GIT_INDEX_FILE stripped) so detection reflects `cwd`'s
+    own repo rather than an inherited git dir."""
+    if env is None:
+        env = _git_env({})
+    r = subprocess.run(["git", *args], capture_output=True, text=True, cwd=cwd, env=env)
     return r.stdout, r.stderr, r.returncode
 
 
+def _shadow_git_dir(root):
+    """Path to the private bare repo backing a non-git folder's checkpoints."""
+    return project_data_dir(root) / "snapshots.git"
+
+
+def _git_env(overlay):
+    """A hermetic git environment: inherit the process env but strip any
+    GIT_DIR/GIT_WORK_TREE/GIT_INDEX_FILE the user's shell may have exported,
+    then apply `overlay`. A real repo (empty overlay) thus always uses plain
+    cwd-based discovery instead of an inherited GIT_DIR; a shadow repo is
+    pinned to its own GIT_DIR/GIT_WORK_TREE."""
+    env = dict(os.environ)
+    for k in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE"):
+        env.pop(k, None)
+    env.update(overlay)
+    return env
+
+
+def _store_overlay(cwd):
+    """Env overlay routing git at `cwd` to this folder's checkpoint store, or
+    {} when the folder is its own real git repo (use its `.git`). Never creates
+    anything — safe on read paths.
+
+    Only *stable* decisions are cached (an existing shadow store, or a real
+    repo); the "no store yet" state is left uncached so a later `git init`, or a
+    shadow created by another process, is picked up on the next call. The cache
+    read is lock-free — dict ops are atomic under the GIL and concurrent writers
+    store the same deterministic value for a key — so the hot path (e.g. the
+    UI's parallel search over many checkpoints) never contends on a lock."""
+    if cwd is None:
+        return {}
+    hit = _STORE_ENV_CACHE.get(cwd)
+    if hit is not None:
+        return hit
+    key = os.path.realpath(cwd)
+    shadow = _shadow_git_dir(key)
+    # Sticky: once a shadow store exists we keep using it even if the folder is
+    # later `git init`-ed, so the pre-init checkpoints never become orphaned.
+    if shadow.is_dir():
+        overlay = {"GIT_DIR": str(shadow), "GIT_WORK_TREE": key}
+        _STORE_ENV_CACHE[cwd] = overlay          # stable: cache it
+    elif is_git_repo(key):
+        overlay = {}                             # real repo, no shadow: default
+        _STORE_ENV_CACHE[cwd] = overlay          # stable: cache it
+    else:
+        # No store yet. Point at the (absent) shadow dir: read-only git commands
+        # fail cleanly to empty output and nothing is created. Deliberately NOT
+        # cached — this folder may still become a real repo or gain a shadow.
+        overlay = {"GIT_DIR": str(shadow), "GIT_WORK_TREE": key}
+    return overlay
+
+
+def git(*args, cwd=None):
+    """Run git for a project dir and return (stdout, stderr, returncode).
+    Transparently routes to the folder's shadow store when it isn't a real
+    git repo (see `_store_overlay`)."""
+    return _raw_git(*args, cwd=cwd, env=_git_env(_store_overlay(cwd)))
+
+
 def is_git_repo(cwd=None):
-    _, _, code = git("rev-parse", "--git-dir", cwd=cwd)
+    """True only when `cwd` is inside its *own* real git repo (ground truth,
+    never routed through a shadow store)."""
+    _, _, code = _raw_git("rev-parse", "--git-dir", cwd=cwd)
     return code == 0
 
 
 def project_root(cwd=None):
-    out, _, code = git("rev-parse", "--show-toplevel", cwd=cwd)
-    return out.strip() if code == 0 else (cwd or os.getcwd())
+    out, _, code = _raw_git("rev-parse", "--show-toplevel", cwd=cwd)
+    return out.strip() if code == 0 else os.path.realpath(cwd or os.getcwd())
+
+
+def _is_snapshottable_root(root):
+    """Guard against turning a sensitive directory into a checkpoint store.
+    The shadow's work-tree is the folder itself, so `git add -A` would sweep in
+    everything under it — fine for a project folder, catastrophic for $HOME or
+    the filesystem root (huge, and full of secrets). Real git repos are never
+    gated here; this only decides whether to *create* a shadow store."""
+    real = os.path.realpath(root)
+    if os.path.dirname(real) == real:          # filesystem root, e.g. "/"
+        return False
+    home = os.path.realpath(os.path.expanduser("~"))
+    if real == home:                           # exactly $HOME
+        return False
+    if home == real or home.startswith(real + os.sep):   # an ancestor of $HOME
+        return False
+    return True
+
+
+def _ensure_shadow(root):
+    """Create (once) the bare shadow repo backing `root`'s checkpoints.
+    Returns True if a usable store exists afterwards."""
+    if not _is_snapshottable_root(root):
+        return False
+    shadow = _shadow_git_dir(root)
+    if shadow.is_dir():
+        return True
+    with _STORE_LOCK:
+        if shadow.is_dir():
+            return True
+        shadow.parent.mkdir(parents=True, exist_ok=True)
+        _, _, code = _raw_git("init", "--bare", "--quiet", str(shadow))
+        if code != 0:
+            return False
+        # A bare repo inherits no identity; pin one so `git commit-tree` works
+        # even when the user has no global git config yet.
+        _raw_git("--git-dir", str(shadow), "config", "user.name", "ckpt")
+        _raw_git("--git-dir", str(shadow), "config", "user.email", "ckpt@localhost")
+    return True
+
+
+def resolve_store(cwd, create=False):
+    """Resolve the folder Claude is working in to (root, has_store).
+
+    - Real git repo  -> (toplevel, True); checkpoints live in its own `.git`.
+    - Sticky shadow  -> (folder, True); a shadow store already exists here.
+    - Fresh folder   -> (folder, <created?>); with create=True a shadow bare
+      repo is initialised (unless the folder is a sensitive root) so the first
+      snapshot has somewhere to go. With create=False, has_store is False.
+    """
+    real = os.path.realpath(cwd or os.getcwd())
+    if _shadow_git_dir(real).is_dir():
+        return real, True                      # sticky shadow wins over .git
+    if is_git_repo(real):
+        return project_root(real), True         # its own real repo
+    if create and _ensure_shadow(real):
+        return real, True
+    return real, False
 
 
 def claude_project_dir():
@@ -245,7 +402,10 @@ def list_projects(include_missing=False):
         rows = []
     out = []
     for pid, path, name, reg, seen in rows:
-        exists = os.path.isdir(path) and os.path.isdir(os.path.join(path, ".git"))
+        # A project "exists" if its folder is still on disk. Checkpoints may
+        # live in the folder's own .git or in a shadow store under the data
+        # dir, so the folder's presence — not a .git — is the right signal.
+        exists = os.path.isdir(path)
         if include_missing or exists:
             out.append({
                 "id": pid, "path": path, "name": name,
@@ -310,10 +470,12 @@ def _purge_in_tree_db(root):
             pass
     if removed_any:
         # Drop the entries from the index so `git status` doesn't flag them
-        # as deleted-against-the-restored-tree.
+        # as deleted-against-the-restored-tree. Route through the store overlay
+        # so this targets the shadow index (not a folder's own `.git`) for
+        # shadow-backed projects, matching the read-tree restore that preceded it.
         subprocess.run(
             ["git", "rm", "--cached", "--ignore-unmatch", "--quiet", "--", *_DB_EXCLUDE_PATHS],
-            capture_output=True, cwd=root,
+            capture_output=True, cwd=root, env=_git_env(_store_overlay(root)),
         )
 
 
@@ -355,7 +517,14 @@ def make_snapshot_commit(root, message):
     try:
         if os.path.exists(live_index):
             shutil.copyfile(live_index, tmp.name)
-        env = os.environ.copy()
+        else:
+            # No live index to seed from (a bare shadow repo, or a repo with
+            # nothing staged yet). Remove the empty temp file so git sees a
+            # *missing* index and creates a valid empty one — leaving a 0-byte
+            # file makes `git add` die with "index file smaller than expected".
+            try: os.unlink(tmp.name)
+            except FileNotFoundError: pass
+        env = _git_env(_store_overlay(root))
         env["GIT_INDEX_FILE"] = tmp.name
         subprocess.run(["git", "add", "-A"], env=env, capture_output=True, cwd=root)
         _strip_db_from_index(root, env)
@@ -370,7 +539,7 @@ def make_snapshot_commit(root, message):
         cmd = ["git", "commit-tree", tree, "-m", message]
         if head:
             cmd.extend(["-p", head])
-        r = subprocess.run(cmd, capture_output=True, text=True, cwd=root)
+        r = subprocess.run(cmd, capture_output=True, text=True, cwd=root, env=env)
         return r.stdout.strip() if r.returncode == 0 else None
     finally:
         try:
@@ -379,8 +548,17 @@ def make_snapshot_commit(root, message):
             pass
 
 
+def _diff_base(root, ref):
+    """Diff base for a checkpoint: its parent commit, or git's empty tree when
+    the checkpoint is parentless. A shadow-repo project has no baseline commit,
+    so its first snapshot is parentless — diffing against the empty tree makes
+    that checkpoint's whole contents show up as additions instead of nothing."""
+    _, _, code = git("rev-parse", "--verify", "--quiet", f"{ref}^", cwd=root)
+    return f"{ref}^" if code == 0 else EMPTY_TREE
+
+
 def compute_shortstat(root, ref):
-    out, _, _ = git("diff", "--shortstat", f"{ref}^", ref, cwd=root)
+    out, _, _ = git("diff", "--shortstat", _diff_base(root, ref), ref, cwd=root)
     files = ins = dels = 0
     m = re.search(r"(\d+) files? changed", out)
     if m: files = int(m.group(1))
@@ -457,7 +635,7 @@ def list_checkpoints(root):
 
 
 def get_files_for(root, ref):
-    out, _, _ = git("diff", "--name-status", f"{ref}^", ref, cwd=root)
+    out, _, _ = git("diff", "--name-status", _diff_base(root, ref), ref, cwd=root)
     files = []
     for line in out.splitlines():
         parts = line.split("\t")
@@ -467,7 +645,7 @@ def get_files_for(root, ref):
 
 
 def get_file_diff(root, ref, path):
-    out, _, _ = git("diff", f"{ref}^", ref, "--", path, cwd=root)
+    out, _, _ = git("diff", _diff_base(root, ref), ref, "--", path, cwd=root)
     return out
 
 
@@ -681,7 +859,7 @@ def _fetch_diff_cached(root, ref):
         cached = _SEARCH_DIFF_CACHE.get(key)
     if cached is not None:
         return cached
-    out, _, _ = git("diff", f"{ref}^", ref, cwd=root)
+    out, _, _ = git("diff", _diff_base(root, ref), ref, cwd=root)
     if len(out) > _SEARCH_DIFF_BYTE_CAP:
         out = out[:_SEARCH_DIFF_BYTE_CAP]
     with _SEARCH_DIFF_CACHE_LOCK:
@@ -960,9 +1138,12 @@ def hook_save_prompt(source="claude"):
     cwd = data.get("cwd") or claude_project_dir()
     if not sid or not prompt:
         return
-    if not is_git_repo(cwd):
+    # Ensure a checkpoint store exists — the project's own repo, or a private
+    # shadow repo for a folder that isn't git-tracked yet. Skips only sensitive
+    # roots ($HOME, filesystem root) where a snapshot shouldn't be taken.
+    root, has_store = resolve_store(cwd, create=True)
+    if not has_store:
         return
-    root = project_root(cwd)
     register_project(root)
 
     # 1. Catch up: snapshot whatever's in the tree against the previous
@@ -1012,7 +1193,14 @@ def _create_checkpoint(root, session_id, source, prompt_text):
     try:
         if os.path.exists(live_index):
             shutil.copyfile(live_index, tmp.name)
-        env = os.environ.copy()
+        else:
+            # No live index to seed from (a bare shadow repo, or a repo with
+            # nothing staged yet). Remove the empty temp file so git sees a
+            # *missing* index and creates a valid empty one — leaving a 0-byte
+            # file makes `git add` die with "index file smaller than expected".
+            try: os.unlink(tmp.name)
+            except FileNotFoundError: pass
+        env = _git_env(_store_overlay(root))
         env["GIT_INDEX_FILE"] = tmp.name
         subprocess.run(["git", "add", "-A"], env=env, capture_output=True, cwd=root)
         _strip_db_from_index(root, env)
@@ -1028,27 +1216,32 @@ def _create_checkpoint(root, session_id, source, prompt_text):
         except Exception:
             pass
 
-    # Skip if identical to the most recent checkpoint (or HEAD if none).
+    # Skip if identical to the most recent checkpoint (or HEAD if none). These
+    # calls reuse `env` so they hit the same (possibly shadow) object store; the
+    # stale GIT_INDEX_FILE it still carries is irrelevant to ref/commit ops.
     latest_r = subprocess.run(
         ["git", "for-each-ref", f"{REF_NS}/", "--sort=-refname", "--format=%(refname)", "--count=1"],
-        capture_output=True, text=True, cwd=root,
+        capture_output=True, text=True, cwd=root, env=env,
     )
     latest = latest_r.stdout.strip()
     if latest:
-        lt = subprocess.run(["git", "rev-parse", f"{latest}^{{tree}}"], capture_output=True, text=True, cwd=root).stdout.strip()
+        lt = subprocess.run(["git", "rev-parse", f"{latest}^{{tree}}"], capture_output=True, text=True, cwd=root, env=env).stdout.strip()
         if tree == lt:
             return None
     else:
-        ht_r = subprocess.run(["git", "rev-parse", "HEAD^{tree}"], capture_output=True, text=True, cwd=root)
+        ht_r = subprocess.run(["git", "rev-parse", "HEAD^{tree}"], capture_output=True, text=True, cwd=root, env=env)
         if tree == ht_r.stdout.strip():
             return None
 
-    head, _, _ = git("rev-parse", "HEAD", cwd=root)
-    head = head.strip()
+    # NB: `git rev-parse HEAD` echoes the literal "HEAD" to stdout (exit 128)
+    # when HEAD is unborn — always the case for a fresh bare shadow repo — so
+    # the return code, not the output, decides whether there's a parent.
+    head, _, code = git("rev-parse", "HEAD", cwd=root)
+    head = head.strip() if code == 0 else ""
     cmd = ["git", "commit-tree", tree, "-m", msg]
     if head:
         cmd.extend(["-p", head])
-    commit = subprocess.run(cmd, capture_output=True, text=True, cwd=root).stdout.strip()
+    commit = subprocess.run(cmd, capture_output=True, text=True, cwd=root, env=env).stdout.strip()
     if not commit:
         return None
 
@@ -1108,9 +1301,9 @@ def hook_checkpoint(source="claude"):
         data = {}
     sid = (data.get("session_id") or "").strip()
     cwd = data.get("cwd") or claude_project_dir()
-    if not is_git_repo(cwd):
+    root, has_store = resolve_store(cwd, create=True)
+    if not has_store:
         return
-    root = project_root(cwd)
     register_project(root)
     prompt = _latest_prompt_for_session(root, sid)
     _create_checkpoint(root, sid, source, prompt)
@@ -1156,9 +1349,10 @@ def _format_msg(subject):
 
 
 def cmd_list():
-    root = project_root()
-    if not is_git_repo(root):
-        die("not a git repository")
+    root, has_store = resolve_store(os.getcwd())
+    if not has_store:
+        print("(no checkpoints)")
+        return
     rows = list_checkpoints(root)
     if not rows:
         print("(no checkpoints)")
@@ -1179,16 +1373,16 @@ def cmd_list():
 
 
 def cmd_show(args):
-    root = project_root()
+    root, _ = resolve_store(os.getcwd())
     ref = _resolve_ref(root, args.ref)
     if not ref:
         die(f"checkpoint not found: {args.ref}")
-    out, _, _ = git("diff", f"{ref}^", ref, cwd=root)
+    out, _, _ = git("diff", _diff_base(root, ref), ref, cwd=root)
     sys.stdout.write(out)
 
 
 def cmd_latest():
-    root = project_root()
+    root, _ = resolve_store(os.getcwd())
     out, _, _ = git("for-each-ref", f"{REF_NS}/", "--sort=-refname", "--format=%(refname)", "--count=1", cwd=root)
     ref = out.strip()
     if not ref:
@@ -1199,12 +1393,12 @@ def cmd_latest():
     when, _, subject = out.strip().partition("\t")
     print(f"{when:<16}  {_format_msg(subject):<55}  {cid}")
     print()
-    out, _, _ = git("diff", "--stat", f"{ref}^", ref, cwd=root)
+    out, _, _ = git("diff", "--stat", _diff_base(root, ref), ref, cwd=root)
     sys.stdout.write(out)
 
 
 def cmd_delete(args):
-    root = project_root()
+    root, _ = resolve_store(os.getcwd())
     ref = _resolve_ref(root, args.ref)
     if not ref:
         die(f"checkpoint not found: {args.ref}")
@@ -1216,7 +1410,7 @@ def cmd_delete(args):
 
 
 def cmd_prune(args):
-    root = project_root()
+    root, _ = resolve_store(os.getcwd())
     r = op_prune(root, args.n)
     if r["deleted"]:
         print(f"pruned {r['deleted']} checkpoint(s); kept newest {args.n}")
@@ -1225,7 +1419,7 @@ def cmd_prune(args):
 
 
 def cmd_clean():
-    root = project_root()
+    root, _ = resolve_store(os.getcwd())
     out, _, _ = git("for-each-ref", f"{REF_NS}/", "--format=%(refname)", cwd=root)
     count = sum(1 for l in out.splitlines() if l.strip())
     if count == 0:
@@ -1240,7 +1434,7 @@ def cmd_clean():
 
 
 def cmd_undo():
-    root = project_root()
+    root, _ = resolve_store(os.getcwd())
     r = op_undo(root)
     if r["ok"]:
         print("reverted to pre-restore state.")
@@ -1249,7 +1443,7 @@ def cmd_undo():
 
 
 def cmd_restore(args):
-    root = project_root()
+    root, _ = resolve_store(os.getcwd())
     if not args.ref:
         return _restore_interactive(root)
     ref = _resolve_ref(root, args.ref)
@@ -1275,14 +1469,20 @@ def _restore_interactive(root):
         for r in rows:
             stat = f"+{r['stats']['insertions']} -{r['stats']['deletions']} · {r['stats']['files']}f"
             lines.append(f"{r['ref']}\t{r['when']:<14}  {_format_msg(r['message']):<55}  {r['id']}  {stat}")
+        # Route the preview's `git diff` to this project's store (shadow repo
+        # for a non-git folder) and fall back to the empty tree so a parentless
+        # first checkpoint still previews its full contents.
+        preview = (f"( git diff {{1}}^ {{1}} 2>/dev/null "
+                   f"|| git diff {EMPTY_TREE} {{1}} 2>/dev/null ) | head -200")
         try:
             res = subprocess.run(
                 ["fzf", "--delimiter=\t", "--with-nth=2", "--prompt=restore to> ",
                  "--height=80%", "--reverse", "--no-mouse",
-                 "--preview", "git diff {1}^ {1} 2>/dev/null | head -200",
+                 "--preview", preview,
                  "--preview-window=right:60%:wrap",
                  "--header=↑/↓ navigate · / search · enter restore · esc cancel"],
                 input="\n".join(lines), capture_output=True, text=True,
+                env=_git_env(_store_overlay(root)),
             )
             if res.returncode != 0 or not res.stdout.strip():
                 print("aborted")
@@ -1311,7 +1511,7 @@ def _confirm_full_restore(root, ref):
     cid = ref.rsplit("/", 1)[-1]
     print()
     print(f"  Checkpoint: {cid}")
-    stat_out, _, _ = git("diff", "--stat", f"{ref}^", ref, cwd=root)
+    stat_out, _, _ = git("diff", "--stat", _diff_base(root, ref), ref, cwd=root)
     for line in stat_out.splitlines():
         print(f"    {line}")
     print()
@@ -1806,8 +2006,10 @@ def cmd_ui(args):
         die(f"web UI not installed at {WEB_DIR}\n"
             f"run the installer or copy web/ from the source tree.")
     # Register current project (best-effort) so it shows up in the picker.
-    if is_git_repo():
-        register_project(project_root())
+    # Any folder with a checkpoint store (its own repo or a shadow one) counts.
+    _ui_root, _ui_has = resolve_store(os.getcwd())
+    if _ui_has:
+        register_project(_ui_root)
     global _running_server, _running_ui_port
     port = args.port or find_free_port()
     server = http.server.ThreadingHTTPServer(("127.0.0.1", port), UIHandler)
@@ -2048,7 +2250,7 @@ def mcp_dispatch_tool(name, args):
         if path:
             return {"checkpoint_id": ckpt_id, "path": path,
                     "diff": get_file_diff(root, ref, path)}
-        out, _, _ = git("diff", f"{ref}^", ref, cwd=root)
+        out, _, _ = git("diff", _diff_base(root, ref), ref, cwd=root)
         return {"checkpoint_id": ckpt_id, "diff": out}
 
     if name == "get_file_at_checkpoint":

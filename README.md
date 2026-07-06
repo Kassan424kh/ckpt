@@ -4,6 +4,8 @@ Per-turn git-ref checkpoints for Claude Code — across multiple projects, with 
 
 Every assistant turn auto-snapshots your working tree into a private git ref namespace (`refs/claude-checkpoints/*`), labelled with the first line of your prompt. Snapshots survive auto-compaction, session restart, and machine reboot. Your working tree, index, and visible git history stay untouched.
 
+**No `git init` required.** Start vibe-coding in a brand-new empty folder and checkpoints accrue from the very first turn — a folder that isn't a git repo yet gets a private *shadow repo* under `~/.local/share/ckpt/` (your folder stays pristine, no `.git` appears). When you later run `git init` for real, ckpt keeps using that shadow store, so nothing from the early development is lost.
+
 ## Screenshots
 
 <table>
@@ -64,7 +66,7 @@ Requires `python3`, `git`, and `curl`. Linux + macOS supported.
 
 ## Quick start
 
-After install, every `claude` session in any git repo auto-creates checkpoints:
+After install, every `claude` session in any project folder auto-creates checkpoints:
 
 ```sh
 cd ~/projects/my-app
@@ -162,7 +164,9 @@ ckpt migrate                    Migrate an old in-repo .claude/ setup to this on
 ~/.claude/settings.json                           Claude Code hooks (user-global)
 ~/.codex/config.toml                              Codex CLI hooks (user-global, if installed)
 
-<each project>/.git/refs/claude-checkpoints/      snapshot refs (immutable commits)
+<each git project>/.git/refs/claude-checkpoints/  snapshot refs (immutable commits)
+~/.local/share/ckpt/projects/<id>/snapshots.git   shadow repo: snapshot refs for
+                                                  folders not git-tracked yet
 ```
 
 The per-project SQLite DB lives **outside** the project tree so a checkpoint
@@ -172,7 +176,7 @@ project, that file (plus any `-journal`/`-wal`/`-shm` sidecars) is migrated
 into the user data dir automatically.
 
 - A `UserPromptSubmit` hook saves the **full** user prompt into the project's local SQLite database.
-- A `Stop` hook fires after each assistant turn. It builds a snapshot using a temporary index + `git add -A` + `git commit-tree` so modifications, deletions, AND new files (respecting `.gitignore`) all land in the tree. The live index and working tree are untouched.
+- A `Stop` hook fires after each assistant turn. It builds a snapshot using a temporary index + `git add -A` + `git commit-tree` so modifications, deletions, AND new files (respecting `.gitignore`) all land in the tree. The live index and working tree are untouched. For a folder that isn't a git repo, the same snapshot goes into a private bare *shadow repo* (driven with the folder as its work-tree) so no `.git` is ever created in your folder.
 - The snapshot's first-line message becomes the git commit message; the full prompt is recorded alongside in SQLite.
 - Aggregate diff stats (`+N / −M / F files`) are computed once at creation and cached.
 
